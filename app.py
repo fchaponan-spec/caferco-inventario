@@ -37,6 +37,41 @@ def candidates(text,df):
     nums=re.findall(r'(?<!\w)\d+(?:[.,]\d+)?(?!\w)',re.sub(re.escape(code),'',line,flags=re.I))
     found.append({'codigo':code,'descripcion':p.descripcion,'cantidad':0.0,'linea_pdf':line[:180]})
  return pd.DataFrame(found,columns=['codigo','descripcion','cantidad','linea_pdf']).drop_duplicates(subset=['codigo','linea_pdf'])
+# Acceso privado: las credenciales se configuran en Streamlit Secrets, nunca en GitHub.
+import hmac
+
+def exigir_acceso():
+ try:
+  usuario_configurado = str(st.secrets["auth"]["username"])
+  clave_configurada = str(st.secrets["auth"]["password"])
+ except (KeyError, FileNotFoundError):
+  st.error("Acceso no configurado. La administradora debe configurar [auth] en Streamlit Secrets.")
+  st.stop()
+ if not usuario_configurado or not clave_configurada or clave_configurada == "CAMBIA_ESTA_CLAVE":
+  st.error("Configura una contraseña privada y segura en Streamlit Secrets.")
+  st.stop()
+ if not st.session_state.get("autenticado", False):
+  st.title("🔒 CAFERCO | Acceso privado")
+  st.caption("Kardex e Inventario Interno")
+  with st.form("iniciar_sesion", clear_on_submit=True):
+   usuario = st.text_input("Usuario")
+   clave = st.text_input("Contraseña", type="password")
+   enviar = st.form_submit_button("Ingresar")
+  if enviar:
+   valido = hmac.compare_digest(usuario.encode(), usuario_configurado.encode()) and hmac.compare_digest(clave.encode(), clave_configurada.encode())
+   if valido:
+    st.session_state["autenticado"] = True
+    st.rerun()
+   else:
+    st.error("Usuario o contraseña incorrectos.")
+  st.stop()
+ with st.sidebar:
+  st.caption("Sesión iniciada")
+  if st.button("Cerrar sesión"):
+   st.session_state["autenticado"] = False
+   st.rerun()
+
+exigir_acceso()
 init()
 st.title('📦 CAFERCO | Kardex e Inventario Interno')
 st.caption('Uso local · Las salidas PDF requieren revisión antes de aplicar descuentos · Guarda copias de seguridad de inventario.db')
