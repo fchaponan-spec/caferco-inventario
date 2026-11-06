@@ -191,7 +191,10 @@ def panel_historial(tipo, prefijo):
         st.info("Todavía no hay movimientos de este tipo.")
         return
     codigos = ["TODOS"] + sorted(h["codigo"].dropna().astype(str).unique().tolist())
-    filtro = st.selectbox("Filtrar por producto", codigos, key=f"{prefijo}_filtro")
+    nombres = dict(zip(h["codigo"].astype(str), h["descripcion"].fillna(h["codigo"]).astype(str)))
+    filtro = st.selectbox("Filtrar por producto", codigos,
+        format_func=lambda c: "TODOS LOS PRODUCTOS" if c == "TODOS" else nombres.get(str(c), str(c)),
+        key=f"{prefijo}_filtro")
     if filtro != "TODOS":
         h = h[h["codigo"] == filtro]
     st.dataframe(h, use_container_width=True, hide_index=True)
@@ -205,7 +208,7 @@ def panel_historial(tipo, prefijo):
         return
     st.markdown("**Editar o eliminar un movimiento**")
     opciones = {
-        int(r.id): f"ID {int(r.id)} | {r.codigo} | {r.cantidad:g} | {r.documento or 'Sin documento'}"
+        int(r.id): f"ID {int(r.id)} | {r.descripcion or r.codigo} | {r.cantidad:g} | {r.documento or 'Sin documento'}"
         for r in h.itertuples(index=False)
     }
     elegido = st.selectbox("Selecciona el movimiento", list(opciones),
@@ -665,9 +668,10 @@ with tabs[3]:
             k["codigo"].dropna().unique().tolist()
         )
 
+        nombres_k = dict(zip(k["codigo"].astype(str), k["descripcion"].fillna(k["codigo"]).astype(str)))
         elegido = st.selectbox(
-            "Filtrar por producto",
-            opciones
+            "Filtrar por producto", opciones,
+            format_func=lambda c: "TODOS LOS PRODUCTOS" if c == "TODOS" else nombres_k.get(str(c), str(c))
         )
 
         if elegido != "TODOS":
