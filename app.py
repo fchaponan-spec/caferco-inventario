@@ -605,7 +605,10 @@ with tabs[1]:
 
         with pesta_editar:
             with st.form("editar_producto_form"):
-                st.text_input("Código (no editable)", value=str(actual["codigo"]), disabled=True)
+                codigo_nuevo = st.text_input(
+                    "Código del producto (editable)", value=str(actual["codigo"]),
+                    help="Si cambias el código, los movimientos y conteos asociados deben conservarse. Ejecuta primero el SQL adjunto."
+                ).strip()
                 descripcion_nueva = st.text_input(
                     "Descripción / medida", value=str(actual["descripcion"])
                 ).strip()
@@ -622,8 +625,8 @@ with tabs[1]:
                 ).strip()
                 confirmar_edicion = st.form_submit_button("💾 Guardar cambios")
             if confirmar_edicion:
-                if not descripcion_nueva or not categoria_nueva:
-                    st.error("La descripción y categoría no pueden estar vacías.")
+                if not codigo_nuevo or not descripcion_nueva or not categoria_nueva:
+                    st.error("El código, la descripción y la categoría no pueden estar vacíos.")
                 else:
                     try:
                         # No permitir cambiar unidad cuando existen movimientos:
@@ -637,7 +640,16 @@ with tabs[1]:
                                     "No puedes cambiar la unidad de un producto con movimientos. "
                                     "Conserva la unidad original para no alterar el Kardex."
                                 )
+                        if codigo_nuevo != producto_seleccionado:
+                            duplicados = db().table("app_productos").select("codigo").eq(
+                                "codigo", codigo_nuevo
+                            ).limit(1).execute().data or []
+                            if duplicados:
+                                raise ValueError("El nuevo código ya existe. Usa uno diferente.")
+                        # Con las claves foráneas ON UPDATE CASCADE del SQL adjunto,
+                        # la base actualiza los códigos relacionados en una operación atómica.
                         db().table("app_productos").update({
+                            "codigo": codigo_nuevo,
                             "descripcion": descripcion_nueva,
                             "unidad": unidad_nueva,
                             "categoria": categoria_nueva
