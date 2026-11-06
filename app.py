@@ -267,50 +267,51 @@ def normalizar_nombre(valor):
 
 
 def detectar_candidatos_por_nombre(texto, catalogo):
-    """Solo compara descripciones, nunca códigos. Requiere cantidad explícita.
+    """Extrae únicamente descripciones del catálogo con cantidad explícita.
 
-    Formato reconocido: NOMBRE COMPLETO DEL PRODUCTO | 3
-    Las coincidencias dudosas se dejan para revisión manual.
+    No identifica productos por código, no usa coincidencias aproximadas y
+    nunca registra movimientos automáticamente.
     """
-    descripciones = catalogo[["codigo", "descripcion"]].dropna().copy()
-    descripciones["normalizado"] = descripciones["descripcion"].map(normalizar_nombre)
-    grupos = descripciones.groupby("normalizado")
-    unicos = {
-        nombre: grupo.iloc[0]["descripcion"]
-        for nombre, grupo in grupos
-        if len(grupo) == 1 and nombre
+    catalogo = catalogo[["codigo", "descripcion"]].dropna().copy()
+    catalogo["normalizado"] = catalogo["descripcion"].map(normalizar_nombre)
+    grupos = catalogo.groupby("normalizado")
+    nombres_unicos = {
+        clave: grupo.iloc[0]["descripcion"]
+        for clave, grupo in grupos
+        if clave and len(grupo) == 1
     }
-    encontrados = []
+    candidatos = []
     no_reconocidas = []
+    # Incluye cantidades enteras y decimales, y unidades al final.
+    patron_cantidad = re.compile(
+        r"(?<![\w])([0-9]{1,7}(?:[.,][0-9]{1,3})?)\s*"
+        r"(?:ROLLOS?|UND(?:IDADES)?|CAJAS?|KG|KGS|PAQ(?:UETES?)?)?\s*$",
+        re.I
+    )
     for linea in texto.splitlines():
-        original = linea.strip()
+        original = " ".join(linea.strip().split())
         if not original:
             continue
-        normal = normalizar_nombre(original)
-        posibles = []
-        for clave, descripcion in unicos.items():
-            # Se exige el nombre completo y una cantidad al final de la línea.
-            if normal.startswith(clave + " "):
-                resto = normal[len(clave):].strip()
-                if re.fullmatch(r"[0-9]+(?: [0-9]{1,3})?", resto):
-                    posibles.append((len(clave), descripcion, resto))
-        if posibles:
-            posibles.sort(reverse=True)
-            largo, descripcion, resto = posibles[0]
-            if len(posibles) > 1 and posibles[1][0] == largo:
-                no_reconocidas.append(original)
-                continue
-            # El número se obtiene del texto original para conservar decimales.
-            patron = re.compile(r"([0-9]+(?:[.,][0-9]{1,3})?)\s*$")
-            m = patron.search(original)
-            if m:
-                cantidad = float(m.group(1).replace(",", "."))
-                if cantidad > 0:
-                    encontrados.append({"nombre": descripcion, "cantidad": cantidad})
-                    continue
-        no_reconocidas.append(original)
-    return encontrados, no_reconocidas
-
+        match_cantidad = patron_cantidad.search(original)
+        if not match_cantidad:
+            no_reconocidas.append(original)
+            continue
+        cantidad = float(match_cantidad.group(1).replace(",", "."))
+        if cantidad <= 0:
+            no_reconocidas.append(original)
+            continue
+        prefijo = normalizar_nombre(original[:match_cantidad.start()])
+        # Permite un código u otro dato antes del nombre, pero nunca lo usa
+        # para identificar el producto. El nombre debe ser completo.
+        coincidencias = [
+            nombre for clave, nombre in nombres_unicos.items()
+            if prefijo == clave or prefijo.endswith(" " + clave)
+        ]
+        if len(coincidencias) == 1:
+            candidatos.append({"nombre": coincidencias[0], "cantidad": cantidad})
+        else:
+            no_reconocidas.append(original)
+    return candidatos, no_reconocidas
 
 
 def mostrar_panel():
@@ -558,150 +559,55 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Catálogo de productos")
-    st.caption("Registra, edita o elimina productos. El código no se modifica para proteger el Kardex.")
 
-    with st.expander("➕ Agregar producto nuevo", expanded=False):
-        with st.form("nuevo_producto", clear_on_submit=True):
-            c1, c2 = st.columns(2)
-            codigo = c1.text_input("Código único").strip().upper()
-            descripcion = c2.text_input("Descripción / medida").strip()
-            unidad = c1.selectbox("Unidad", ["UND", "ROLLO", "KG", "CAJA", "M", "M2"])
-            categoria = c2.text_input("Categoría (mallas, clavos, alambres, etc.)").strip()
-            guardar = st.form_submit_button("Guardar producto")
-        if guardar:
-            if not codigo or not descripcion:
-                st.error("Ingresa código y descripción")
-            else:
-                try:
-                    db().table("app_productos").insert({
-                        "codigo": codigo,
-                        "descripcion": descripcion,
-                        "unidad": unidad,
-                        "categoria": categoria
-                    }).execute()
-                    st.success("Producto guardado")
-                    st.rerun()
-                except Exception as e:
-                    st.error(f"No se pudo guardar el producto: {e}")
+    with st.form("nuevo_producto", clear_on_submit=True):
+        c1, c2 = st.columns(2)
 
-    p_catalogo = productos()
-    st.dataframe(p_catalogo, use_container_width=True, hide_index=True)
+        codigo = c1.text_input(
+            "Código único"
+        ).strip().upper()
 
-    if not p_catalogo.empty:
-        etiquetas_producto = {
-            str(r.codigo): f"{r.descripcion} — {r.codigo}"
-            for r in p_catalogo.itertuples()
-        }
-        st.divider()
-        st.subheader("Administrar productos existentes")
-        producto_seleccionado = st.selectbox(
-            "Selecciona el producto que deseas modificar o eliminar",
-            list(etiquetas_producto),
-            format_func=lambda c: etiquetas_producto[c],
-            key="admin_producto_codigo"
+        descripcion = c2.text_input(
+            "Descripción / medida"
+        ).strip()
+
+        unidad = c1.selectbox(
+            "Unidad",
+            ["UND", "ROLLO", "KG", "CAJA", "M", "M2"]
         )
-        actual = p_catalogo[p_catalogo["codigo"] == producto_seleccionado].iloc[0]
-        pesta_editar, pesta_eliminar = st.tabs(["✏️ Editar producto", "🗑️ Eliminar producto"])
 
-        with pesta_editar:
-            with st.form("editar_producto_form"):
-                codigo_nuevo = st.text_input(
-                    "Código del producto (editable)", value=str(actual["codigo"]),
-                    help="Si cambias el código, los movimientos y conteos asociados deben conservarse. Ejecuta primero el SQL adjunto."
-                ).strip()
-                descripcion_nueva = st.text_input(
-                    "Descripción / medida", value=str(actual["descripcion"])
-                ).strip()
-                unidades_disponibles = ["UND", "ROLLO", "KG", "CAJA", "M", "M2"]
-                unidad_actual = str(actual["unidad"])
-                if unidad_actual not in unidades_disponibles:
-                    unidades_disponibles.append(unidad_actual)
-                unidad_nueva = st.selectbox(
-                    "Unidad", unidades_disponibles,
-                    index=unidades_disponibles.index(unidad_actual)
-                )
-                categoria_nueva = st.text_input(
-                    "Categoría", value=str(actual["categoria"])
-                ).strip()
-                confirmar_edicion = st.form_submit_button("💾 Guardar cambios")
-            if confirmar_edicion:
-                if not codigo_nuevo or not descripcion_nueva or not categoria_nueva:
-                    st.error("El código, la descripción y la categoría no pueden estar vacíos.")
-                else:
-                    try:
-                        # No permitir cambiar unidad cuando existen movimientos:
-                        # alteraría el significado de cantidades históricas.
-                        if unidad_nueva != unidad_actual:
-                            referencias = db().table("app_movimientos").select("id").eq(
-                                "codigo", producto_seleccionado
-                            ).limit(1).execute().data or []
-                            if referencias:
-                                raise ValueError(
-                                    "No puedes cambiar la unidad de un producto con movimientos. "
-                                    "Conserva la unidad original para no alterar el Kardex."
-                                )
-                        if codigo_nuevo != producto_seleccionado:
-                            duplicados = db().table("app_productos").select("codigo").eq(
-                                "codigo", codigo_nuevo
-                            ).limit(1).execute().data or []
-                            if duplicados:
-                                raise ValueError("El nuevo código ya existe. Usa uno diferente.")
-                        # Con las claves foráneas ON UPDATE CASCADE del SQL adjunto,
-                        # la base actualiza los códigos relacionados en una operación atómica.
-                        db().table("app_productos").update({
-                            "codigo": codigo_nuevo,
-                            "descripcion": descripcion_nueva,
-                            "unidad": unidad_nueva,
-                            "categoria": categoria_nueva
-                        }).eq("codigo", producto_seleccionado).execute()
-                        st.success("Producto actualizado correctamente")
-                        st.rerun()
-                    except Exception as e:
-                        st.error(f"No se pudo editar: {e}")
+        categoria = c2.text_input(
+            "Categoría (mallas, clavos, alambres, etc.)"
+        ).strip()
 
-        with pesta_eliminar:
-            st.warning(
-                "Solo se pueden eliminar productos sin movimientos ni conteos físicos. "
-                "Los productos con historial deben conservarse para no afectar el Kardex."
-            )
-            st.write("**Producto:**", str(actual["descripcion"]))
-            st.write("**Código:**", producto_seleccionado)
-            with st.form("eliminar_producto_form"):
-                confirmar_borrado = st.checkbox(
-                    "Confirmo que deseo eliminar este producto del catálogo"
+        guardar = st.form_submit_button("Guardar producto")
+
+    if guardar:
+        if not codigo or not descripcion:
+            st.error("Ingresa código y descripción")
+        else:
+            try:
+                db().table("app_productos").insert({
+                    "codigo": codigo,
+                    "descripcion": descripcion,
+                    "unidad": unidad,
+                    "categoria": categoria
+                }).execute()
+
+                st.success("Producto guardado")
+                st.rerun()
+
+            except Exception as e:
+                st.error(
+                    f"No se pudo guardar el producto: {e}"
                 )
-                eliminar = st.form_submit_button("🗑️ Eliminar definitivamente")
-            if eliminar:
-                if not confirmar_borrado:
-                    st.error("Marca la casilla de confirmación.")
-                else:
-                    try:
-                        tiene_movimientos = db().table("app_movimientos").select("id").eq(
-                            "codigo", producto_seleccionado
-                        ).limit(1).execute().data or []
-                        if tiene_movimientos:
-                            st.error(
-                                "No se puede eliminar: este producto tiene movimientos "
-                                "de inventario. Se conserva para proteger el Kardex."
-                            )
-                        else:
-                            # La FK de conteos físicos y otras relaciones de Supabase
-                            # deben impedir el borrado si existen registros asociados.
-                            tiene_conteos = db().table("app_conteos_fisicos").select("id").eq(
-                                "codigo", producto_seleccionado
-                            ).limit(1).execute().data or []
-                            if tiene_conteos:
-                                st.error(
-                                    "No se puede eliminar: este producto tiene conteos físicos."
-                                )
-                            else:
-                                db().table("app_productos").delete().eq(
-                                    "codigo", producto_seleccionado
-                                ).execute()
-                                st.success("Producto eliminado del catálogo")
-                                st.rerun()
-                    except Exception as e:
-                        st.error(f"No se pudo eliminar: {e}")
+
+    st.dataframe(
+        productos(),
+        use_container_width=True,
+        hide_index=True
+    )
+
 
 with tabs[2]:
     st.subheader("Registrar ingreso de mercadería")
@@ -820,7 +726,7 @@ with tabs[3]:
                 )
                 st.stop()
 
-            st.caption("La lectura automática busca NOMBRES completos, nunca códigos. Verifica cada línea antes de descontar stock.")
+            st.caption("La lectura automática busca nombres completos del catálogo y cantidades. Los códigos del PDF no se usan para identificar productos.")
             pendientes = st.session_state.get("lineas_no_reconocidas", [])
             if pendientes:
                 with st.expander(f"Líneas no reconocidas automáticamente ({len(pendientes)})"):
@@ -848,23 +754,45 @@ with tabs[3]:
                 key=f"editor_pdf_{huella}"
             )
 
-            st.subheader("Stock disponible")
-
-            st.dataframe(
-                stock(),
-                use_container_width=True,
-                hide_index=True
-            )
-
+            st.subheader("Vista previa antes de descontar")
+            st.caption("Esta tabla es solo una simulación. El stock no cambia hasta confirmar.")
+            saldos = stock()
+            conteos_nombres = p["descripcion"].value_counts()
+            mapa_nombres = dict(zip(p["descripcion"], p["codigo"]))
+            filas_preview = []
+            for fila in editadas.itertuples(index=False):
+                nombre = str(fila.nombre)
+                try:
+                    cantidad = float(fila.cantidad)
+                except (ValueError, TypeError):
+                    cantidad = 0
+                codigo = mapa_nombres.get(nombre) if conteos_nombres.get(nombre, 0) == 1 else None
+                actual = saldos.loc[saldos["codigo"] == codigo, "stock"] if codigo else pd.Series(dtype=float)
+                disponible = float(actual.iloc[0]) if not actual.empty else None
+                filas_preview.append({
+                    "Producto": nombre,
+                    "Cantidad a salir": cantidad,
+                    "Stock actual": disponible,
+                    "Stock proyectado": disponible - cantidad if disponible is not None else None,
+                    "Estado": "OK" if disponible is not None and cantidad > 0 and disponible >= cantidad else "REVISAR"
+                })
+            vista_previa = pd.DataFrame(filas_preview)
+            if not vista_previa.empty:
+                st.dataframe(vista_previa, use_container_width=True, hide_index=True)
+                if (vista_previa["Estado"] != "OK").any():
+                    st.error("Hay productos sin identificar, cantidades inválidas o stock insuficiente. Corrige antes de confirmar.")
+            else:
+                st.info("No hay productos reconocidos. Agrega manualmente las líneas de la guía.")
+            st.caption("Comprueba también que no falte ningún producto de la guía. Las líneas no reconocidas no se descuentan.")
             confirmar = st.checkbox(
-                "He revisado el PDF, los códigos, "
-                "las cantidades y el número de guía"
+                "Comparé cada producto y cantidad con la guía original, revisé las líneas no reconocidas y autorizo descontar el stock",
+                key=f"confirmar_guia_{huella}"
             )
 
             if st.button(
                 "Confirmar salida y descontar stock",
                 type="primary",
-                disabled=not confirmar
+                disabled=(not confirmar or vista_previa.empty or (vista_previa["Estado"] != "OK").any())
             ):
                 try:
                     if not numero:
