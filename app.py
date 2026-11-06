@@ -3,6 +3,7 @@ import re
 import hashlib
 import hmac
 from datetime import datetime
+import unicodedata
 
 import fitz
 import pandas as pd
@@ -257,28 +258,115 @@ def texto_pdf(archivo):
         )
 
 
-def detectar_candidatos(texto, codigos):
+def normalizar_nombre(valor):
+    texto = unicodedata.normalize("NFKD", str(valor).upper())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = texto.replace("×", "X").replace("½", "1/2")
+    texto = re.sub(r"[^A-Z0-9]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def detectar_candidatos_por_nombre(texto, catalogo):
+    """Solo compara descripciones, nunca códigos. Requiere cantidad explícita.
+
+    Formato reconocido: NOMBRE COMPLETO DEL PRODUCTO | 3
+    Las coincidencias dudosas se dejan para revisión manual.
+    """
+    descripciones = catalogo[["codigo", "descripcion"]].dropna().copy()
+    descripciones["normalizado"] = descripciones["descripcion"].map(normalizar_nombre)
+    grupos = descripciones.groupby("normalizado")
+    unicos = {
+        nombre: grupo.iloc[0]["descripcion"]
+        for nombre, grupo in grupos
+        if len(grupo) == 1 and nombre
+    }
     encontrados = []
-
+    no_reconocidas = []
     for linea in texto.splitlines():
-        for codigo in codigos:
-            patron = (
-                rf"(?<![\w-]){re.escape(str(codigo))}"
-                rf"(?![\w-])\s+([0-9]+(?:[.,][0-9]+)?)"
-            )
-            m = re.search(patron, linea, re.IGNORECASE)
-
+        original = linea.strip()
+        if not original:
+            continue
+        normal = normalizar_nombre(original)
+        posibles = []
+        for clave, descripcion in unicos.items():
+            # Se exige el nombre completo y una cantidad al final de la línea.
+            if normal.startswith(clave + " "):
+                resto = normal[len(clave):].strip()
+                if re.fullmatch(r"[0-9]+(?: [0-9]{1,3})?", resto):
+                    posibles.append((len(clave), descripcion, resto))
+        if posibles:
+            posibles.sort(reverse=True)
+            largo, descripcion, resto = posibles[0]
+            if len(posibles) > 1 and posibles[1][0] == largo:
+                no_reconocidas.append(original)
+                continue
+            # El número se obtiene del texto original para conservar decimales.
+            patron = re.compile(r"([0-9]+(?:[.,][0-9]{1,3})?)\s*$")
+            m = patron.search(original)
             if m:
-                cantidad = float(
-                    m.group(1).replace(",", ".")
-                )
+                cantidad = float(m.group(1).replace(",", "."))
                 if cantidad > 0:
-                    encontrados.append({
-                        "codigo": codigo,
-                        "cantidad": cantidad
-                    })
+                    encontrados.append({"nombre": descripcion, "cantidad": cantidad})
+                    continue
+        no_reconocidas.append(original)
+    return encontrados, no_reconocidas
 
-    return encontrados
+
+def mostrar_panel():
+    st.subheader("Panel de control de inventario")
+    p = productos()
+    m = movimientos()
+    s = stock()
+    if p.empty:
+        st.info("Registra productos para comenzar a ver los indicadores.")
+        return
+    if not m.empty:
+        m = m.copy()
+        m["cantidad"] = pd.to_numeric(m["cantidad"], errors="coerce").fillna(0)
+        m["fecha_dt"] = pd.to_datetime(m["fecha"], errors="coerce", utc=True)
+        ahora = pd.Timestamp.now(tz="UTC")
+        mes = m[m["fecha_dt"].dt.to_period("M") == ahora.to_period("M")]
+    else:
+        mes = m
+    ingresos_mes = float(mes.loc[mes["tipo"] == "INGRESO", "cantidad"].sum()) if not mes.empty else 0
+    salidas_mes = float(mes.loc[mes["tipo"] == "SALIDA", "cantidad"].sum()) if not mes.empty else 0
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Productos registrados", len(p))
+    c2.metric("Ingresos del mes (unidades)", f"{ingresos_mes:,.3f}")
+    c3.metric("Salidas del mes (unidades)", f"{salidas_mes:,.3f}")
+    c4.metric("Productos con stock positivo", int((s["stock"] > 0).sum()))
+    st.caption("Los totales de cantidades pueden mezclar rollos, kilos y otras unidades. Para comparar productos se usa su unidad de medida.")
+    if m.empty:
+        st.info("Todavía no hay movimientos registrados.")
+        return
+    periodo = st.selectbox("Periodo del análisis", ["Últimos 30 días", "Este mes", "Todo el historial"], key="periodo_panel")
+    if periodo == "Últimos 30 días":
+        vista = m[m["fecha_dt"] >= ahora - pd.Timedelta(days=30)].copy()
+    elif periodo == "Este mes":
+        vista = mes.copy()
+    else:
+        vista = m.copy()
+    categoria = st.selectbox("Categoría", ["TODAS"] + sorted(p["categoria"].dropna().astype(str).unique().tolist()), key="categoria_panel")
+    if categoria != "TODAS":
+        codigos = set(p.loc[p["categoria"] == categoria, "codigo"])
+        vista = vista[vista["codigo"].isin(codigos)]
+    vista = vista[vista["tipo"].isin(["INGRESO", "SALIDA"])].copy()
+    if vista.empty:
+        st.info("No hay movimientos en este periodo o categoría.")
+        return
+    vista = vista.merge(p[["codigo", "descripcion", "unidad", "categoria"]], on="codigo", how="left")
+    resumen = vista.pivot_table(index=["codigo", "descripcion", "unidad", "categoria"], columns="tipo", values="cantidad", aggfunc="sum", fill_value=0).reset_index()
+    for campo in ["INGRESO", "SALIDA"]:
+        if campo not in resumen.columns:
+            resumen[campo] = 0.0
+    resumen["MOVIMIENTO TOTAL"] = resumen["INGRESO"] + resumen["SALIDA"]
+    unidad = st.selectbox("Comparar productos por unidad", sorted(resumen["unidad"].dropna().unique().tolist()), key="unidad_panel")
+    resumen = resumen[resumen["unidad"] == unidad].sort_values("MOVIMIENTO TOTAL", ascending=False)
+    st.subheader("Productos con mayor movimiento")
+    st.caption("Movimiento total = ingresos + salidas, sin contar ajustes. Se comparan productos de la misma unidad.")
+    st.bar_chart(resumen.head(10).set_index("descripcion")[["INGRESO", "SALIDA"]], horizontal=True)
+    st.dataframe(resumen.rename(columns={"descripcion":"Producto", "unidad":"Unidad", "categoria":"Categoría", "INGRESO":"Ingresos", "SALIDA":"Salidas", "MOVIMIENTO TOTAL":"Movimiento total"}), use_container_width=True, hide_index=True)
+    st.download_button("Descargar ranking de movimientos Excel", excel(resumen), "caferco_ranking_movimientos.xlsx", key="descarga_ranking")
 
 
 def exigir_acceso():
@@ -347,6 +435,7 @@ except Exception as e:
 
 
 tabs = st.tabs([
+    "📈 Panel",
     "📦 Productos",
     "➕ Ingresos",
     "📄 Salidas PDF",
@@ -357,6 +446,10 @@ tabs = st.tabs([
 
 
 with tabs[0]:
+    mostrar_panel()
+
+
+with tabs[1]:
     st.subheader("Catálogo de productos")
 
     with st.form("nuevo_producto", clear_on_submit=True):
@@ -408,7 +501,7 @@ with tabs[0]:
     )
 
 
-with tabs[1]:
+with tabs[2]:
     st.subheader("Registrar ingreso de mercadería")
 
     p = productos()
@@ -467,7 +560,7 @@ with tabs[1]:
     panel_historial("INGRESO", "ingresos")
 
 
-with tabs[2]:
+with tabs[3]:
     st.subheader(
         "Salida por guía PDF — revisión obligatoria"
     )
@@ -515,16 +608,9 @@ with tabs[2]:
 
                 if st.session_state.get("pdf_hash") != huella:
                     st.session_state["pdf_hash"] = huella
-
-                    st.session_state["lineas_pdf"] = (
-                        pd.DataFrame(
-                            detectar_candidatos(
-                                texto,
-                                p["codigo"].tolist()
-                            ),
-                            columns=["codigo", "cantidad"]
-                        )
-                    )
+                    candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p)
+                    st.session_state["lineas_pdf"] = pd.DataFrame(candidatos, columns=["nombre", "cantidad"])
+                    st.session_state["lineas_no_reconocidas"] = no_reconocidas
 
             except Exception as e:
                 st.error(
@@ -532,9 +618,12 @@ with tabs[2]:
                 )
                 st.stop()
 
-            st.caption(
-                "Puedes corregir, agregar o eliminar filas."
-            )
+            st.caption("La lectura automática busca NOMBRES completos, nunca códigos. Verifica cada línea antes de descontar stock.")
+            pendientes = st.session_state.get("lineas_no_reconocidas", [])
+            if pendientes:
+                with st.expander(f"Líneas no reconocidas automáticamente ({len(pendientes)})"):
+                    st.text("\n".join(pendientes[:150]))
+            st.caption("Puedes corregir, agregar o eliminar filas. Selecciona el nombre exacto del catálogo.")
 
             editadas = st.data_editor(
                 st.session_state["lineas_pdf"],
@@ -542,9 +631,9 @@ with tabs[2]:
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "codigo": st.column_config.SelectboxColumn(
-                        "Código",
-                        options=p["codigo"].tolist(),
+                    "nombre": st.column_config.SelectboxColumn(
+                        "Nombre completo del producto",
+                        options=p["descripcion"].dropna().tolist(),
                         required=True
                     ),
                     "cantidad": st.column_config.NumberColumn(
@@ -587,30 +676,23 @@ with tabs[2]:
                         )
 
                     if editadas[
-                        ["codigo", "cantidad"]
+                        ["nombre", "cantidad"]
                     ].isna().any().any():
                         raise ValueError(
                             "Hay códigos o cantidades vacíos"
                         )
 
                     lineas = []
-                    codigos_validos = set(p["codigo"])
-
-                    for fila in editadas.itertuples(
-                        index=False
-                    ):
-                        if (
-                            fila.codigo not in codigos_validos
-                            or float(fila.cantidad) <= 0
-                        ):
-                            raise ValueError(
-                                "Código o cantidad inválidos"
-                            )
-
-                        lineas.append({
-                            "codigo": str(fila.codigo),
-                            "cantidad": float(fila.cantidad)
-                        })
+                    # Solo nombres únicos: no se adivina un código si hay descripciones duplicadas.
+                    conteos_nombres = p["descripcion"].value_counts()
+                    mapa_nombres = dict(zip(p["descripcion"], p["codigo"]))
+                    for fila in editadas.itertuples(index=False):
+                        nombre = str(fila.nombre)
+                        if nombre not in mapa_nombres or conteos_nombres[nombre] != 1:
+                            raise ValueError(f"Nombre no encontrado o duplicado: {nombre}. Corrige el catálogo antes de continuar.")
+                        if float(fila.cantidad) <= 0:
+                            raise ValueError("La cantidad debe ser mayor que cero")
+                        lineas.append({"codigo": str(mapa_nombres[nombre]), "cantidad": float(fila.cantidad)})
 
                     db().rpc(
                         "app_registrar_salida",
@@ -630,9 +712,8 @@ with tabs[2]:
                     st.session_state.pop(
                         "pdf_hash", None
                     )
-                    st.session_state.pop(
-                        "lineas_pdf", None
-                    )
+                    st.session_state.pop("lineas_pdf", None)
+                    st.session_state.pop("lineas_no_reconocidas", None)
 
                 except Exception as e:
                     st.error(
@@ -642,7 +723,7 @@ with tabs[2]:
     panel_historial("SALIDA", "salidas")
 
 
-with tabs[3]:
+with tabs[4]:
     st.subheader("Stock actualizado")
 
     s = stock()
@@ -690,7 +771,7 @@ with tabs[3]:
     )
 
 
-with tabs[4]:
+with tabs[5]:
     st.subheader("Inventario físico — conteos guardados")
     st.caption("Los conteos se guardan en Supabase. No modifican el stock del Kardex.")
     s = stock()
@@ -787,7 +868,7 @@ with tabs[4]:
             )
 
 
-with tabs[5]:
+with tabs[6]:
     st.subheader("Copias de seguridad")
 
     st.info(
