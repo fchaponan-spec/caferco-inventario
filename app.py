@@ -558,55 +558,138 @@ with tabs[0]:
 
 with tabs[1]:
     st.subheader("Catálogo de productos")
+    st.caption("Registra, edita o elimina productos. El código no se modifica para proteger el Kardex.")
 
-    with st.form("nuevo_producto", clear_on_submit=True):
-        c1, c2 = st.columns(2)
+    with st.expander("➕ Agregar producto nuevo", expanded=False):
+        with st.form("nuevo_producto", clear_on_submit=True):
+            c1, c2 = st.columns(2)
+            codigo = c1.text_input("Código único").strip().upper()
+            descripcion = c2.text_input("Descripción / medida").strip()
+            unidad = c1.selectbox("Unidad", ["UND", "ROLLO", "KG", "CAJA", "M", "M2"])
+            categoria = c2.text_input("Categoría (mallas, clavos, alambres, etc.)").strip()
+            guardar = st.form_submit_button("Guardar producto")
+        if guardar:
+            if not codigo or not descripcion:
+                st.error("Ingresa código y descripción")
+            else:
+                try:
+                    db().table("app_productos").insert({
+                        "codigo": codigo,
+                        "descripcion": descripcion,
+                        "unidad": unidad,
+                        "categoria": categoria
+                    }).execute()
+                    st.success("Producto guardado")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"No se pudo guardar el producto: {e}")
 
-        codigo = c1.text_input(
-            "Código único"
-        ).strip().upper()
+    p_catalogo = productos()
+    st.dataframe(p_catalogo, use_container_width=True, hide_index=True)
 
-        descripcion = c2.text_input(
-            "Descripción / medida"
-        ).strip()
-
-        unidad = c1.selectbox(
-            "Unidad",
-            ["UND", "ROLLO", "KG", "CAJA", "M", "M2"]
+    if not p_catalogo.empty:
+        etiquetas_producto = {
+            str(r.codigo): f"{r.descripcion} — {r.codigo}"
+            for r in p_catalogo.itertuples()
+        }
+        st.divider()
+        st.subheader("Administrar productos existentes")
+        producto_seleccionado = st.selectbox(
+            "Selecciona el producto que deseas modificar o eliminar",
+            list(etiquetas_producto),
+            format_func=lambda c: etiquetas_producto[c],
+            key="admin_producto_codigo"
         )
+        actual = p_catalogo[p_catalogo["codigo"] == producto_seleccionado].iloc[0]
+        pesta_editar, pesta_eliminar = st.tabs(["✏️ Editar producto", "🗑️ Eliminar producto"])
 
-        categoria = c2.text_input(
-            "Categoría (mallas, clavos, alambres, etc.)"
-        ).strip()
-
-        guardar = st.form_submit_button("Guardar producto")
-
-    if guardar:
-        if not codigo or not descripcion:
-            st.error("Ingresa código y descripción")
-        else:
-            try:
-                db().table("app_productos").insert({
-                    "codigo": codigo,
-                    "descripcion": descripcion,
-                    "unidad": unidad,
-                    "categoria": categoria
-                }).execute()
-
-                st.success("Producto guardado")
-                st.rerun()
-
-            except Exception as e:
-                st.error(
-                    f"No se pudo guardar el producto: {e}"
+        with pesta_editar:
+            with st.form("editar_producto_form"):
+                st.text_input("Código (no editable)", value=str(actual["codigo"]), disabled=True)
+                descripcion_nueva = st.text_input(
+                    "Descripción / medida", value=str(actual["descripcion"])
+                ).strip()
+                unidades_disponibles = ["UND", "ROLLO", "KG", "CAJA", "M", "M2"]
+                unidad_actual = str(actual["unidad"])
+                if unidad_actual not in unidades_disponibles:
+                    unidades_disponibles.append(unidad_actual)
+                unidad_nueva = st.selectbox(
+                    "Unidad", unidades_disponibles,
+                    index=unidades_disponibles.index(unidad_actual)
                 )
+                categoria_nueva = st.text_input(
+                    "Categoría", value=str(actual["categoria"])
+                ).strip()
+                confirmar_edicion = st.form_submit_button("💾 Guardar cambios")
+            if confirmar_edicion:
+                if not descripcion_nueva or not categoria_nueva:
+                    st.error("La descripción y categoría no pueden estar vacías.")
+                else:
+                    try:
+                        # No permitir cambiar unidad cuando existen movimientos:
+                        # alteraría el significado de cantidades históricas.
+                        if unidad_nueva != unidad_actual:
+                            referencias = db().table("app_movimientos").select("id").eq(
+                                "codigo", producto_seleccionado
+                            ).limit(1).execute().data or []
+                            if referencias:
+                                raise ValueError(
+                                    "No puedes cambiar la unidad de un producto con movimientos. "
+                                    "Conserva la unidad original para no alterar el Kardex."
+                                )
+                        db().table("app_productos").update({
+                            "descripcion": descripcion_nueva,
+                            "unidad": unidad_nueva,
+                            "categoria": categoria_nueva
+                        }).eq("codigo", producto_seleccionado).execute()
+                        st.success("Producto actualizado correctamente")
+                        st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo editar: {e}")
 
-    st.dataframe(
-        productos(),
-        use_container_width=True,
-        hide_index=True
-    )
-
+        with pesta_eliminar:
+            st.warning(
+                "Solo se pueden eliminar productos sin movimientos ni conteos físicos. "
+                "Los productos con historial deben conservarse para no afectar el Kardex."
+            )
+            st.write("**Producto:**", str(actual["descripcion"]))
+            st.write("**Código:**", producto_seleccionado)
+            with st.form("eliminar_producto_form"):
+                confirmar_borrado = st.checkbox(
+                    "Confirmo que deseo eliminar este producto del catálogo"
+                )
+                eliminar = st.form_submit_button("🗑️ Eliminar definitivamente")
+            if eliminar:
+                if not confirmar_borrado:
+                    st.error("Marca la casilla de confirmación.")
+                else:
+                    try:
+                        tiene_movimientos = db().table("app_movimientos").select("id").eq(
+                            "codigo", producto_seleccionado
+                        ).limit(1).execute().data or []
+                        if tiene_movimientos:
+                            st.error(
+                                "No se puede eliminar: este producto tiene movimientos "
+                                "de inventario. Se conserva para proteger el Kardex."
+                            )
+                        else:
+                            # La FK de conteos físicos y otras relaciones de Supabase
+                            # deben impedir el borrado si existen registros asociados.
+                            tiene_conteos = db().table("app_conteos_fisicos").select("id").eq(
+                                "codigo", producto_seleccionado
+                            ).limit(1).execute().data or []
+                            if tiene_conteos:
+                                st.error(
+                                    "No se puede eliminar: este producto tiene conteos físicos."
+                                )
+                            else:
+                                db().table("app_productos").delete().eq(
+                                    "codigo", producto_seleccionado
+                                ).execute()
+                                st.success("Producto eliminado del catálogo")
+                                st.rerun()
+                    except Exception as e:
+                        st.error(f"No se pudo eliminar: {e}")
 
 with tabs[2]:
     st.subheader("Registrar ingreso de mercadería")
