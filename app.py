@@ -1,3 +1,867 @@
+import io
+import re
+import hashlib
+import hmac
+from datetime import datetime
+import unicodedata
+
+import fitz
+import pandas as pd
+import streamlit as st
+from supabase import create_client
+
+st.set_page_config(
+    page_title="CAFERCO | Kardex e Inventario Interno",
+    page_icon="📦",
+    layout="wide"
+)
+
+
+@st.cache_resource
+def cliente():
+    url = st.secrets["supabase"]["url"]
+    key = st.secrets["supabase"]["key"]
+    if not url or not key:
+        raise ValueError("Faltan URL o clave de Supabase en Secrets")
+    return create_client(url, key)
+
+
+def db():
+    return cliente().schema("caferco")
+
+
+def leer_todos(tabla, columnas="*", orden="", ascendente=True):
+    salida = []
+    inicio = 0
+    tamano = 500
+    while True:
+        q = db().table(tabla).select(columnas)
+        if orden:
+            q = q.order(orden, desc=not ascendente)
+        lote = q.range(inicio, inicio + tamano - 1).execute().data or []
+        salida.extend(lote)
+        if len(lote) < tamano:
+            break
+        inicio += tamano
+    return salida
+
+
+def productos():
+    return pd.DataFrame(
+        leer_todos("app_productos", orden="descripcion"),
+        columns=["codigo", "descripcion", "unidad", "categoria"]
+    )
+
+
+def movimientos():
+    return pd.DataFrame(
+        leer_todos("app_movimientos", orden="id"),
+        columns=[
+            "id", "fecha", "codigo", "tipo",
+            "cantidad", "documento", "nota"
+        ]
+    )
+
+
+def documentos():
+    return pd.DataFrame(
+        leer_todos("app_documentos", orden="fecha"),
+        columns=["clave", "fecha", "numero"]
+    )
+
+
+def stock():
+    p = productos()
+    m = movimientos()
+
+    if p.empty:
+        return pd.DataFrame(
+            columns=[
+                "codigo", "descripcion", "unidad",
+                "categoria", "stock"
+            ]
+        )
+
+    if m.empty:
+        p["stock"] = 0.0
+    else:
+        m["cantidad"] = pd.to_numeric(
+            m["cantidad"], errors="coerce"
+        ).fillna(0)
+
+        m["variacion"] = m["cantidad"] * m["tipo"].isin(
+            ["INGRESO", "AJUSTE+"]
+        ).map({True: 1, False: -1})
+
+        totales = m.groupby(
+            "codigo", as_index=False
+        )["variacion"].sum()
+
+        p = p.merge(totales, on="codigo", how="left")
+        p["stock"] = p.pop("variacion").fillna(0).round(3)
+
+    return p
+
+
+def kardex():
+    m = movimientos()
+
+    if m.empty:
+        return pd.DataFrame(
+            columns=[
+                "fecha", "codigo", "descripcion", "tipo",
+                "ingreso", "salida", "saldo",
+                "documento", "nota"
+            ]
+        )
+
+    p = productos()[["codigo", "descripcion"]]
+    m = m.merge(p, on="codigo", how="left")
+
+    m["cantidad"] = pd.to_numeric(
+        m["cantidad"], errors="coerce"
+    ).fillna(0)
+
+    m["ingreso"] = m["cantidad"].where(
+        m["tipo"].isin(["INGRESO", "AJUSTE+"]), 0
+    )
+    m["salida"] = m["cantidad"].where(
+        m["tipo"].isin(["SALIDA", "AJUSTE-"]), 0
+    )
+
+    m = m.sort_values(["fecha", "id"])
+
+    m["saldo"] = (
+        m["ingreso"] - m["salida"]
+    ).groupby(m["codigo"]).cumsum().round(3)
+
+    return m[
+        [
+            "fecha", "codigo", "descripcion", "tipo",
+            "ingreso", "salida", "saldo",
+            "documento", "nota"
+        ]
+    ]
+
+
+def registrar_movimiento(
+    codigo, tipo, cantidad, documento="", nota=""
+):
+    cantidad = float(cantidad)
+
+    if cantidad <= 0:
+        raise ValueError("La cantidad debe ser mayor que cero")
+
+    if tipo not in ("INGRESO", "AJUSTE+", "AJUSTE-"):
+        raise ValueError("Tipo de movimiento no permitido")
+
+    if tipo == "AJUSTE-":
+        raise ValueError(
+            "Los ajustes negativos requieren una operación "
+            "transaccional en la base de datos"
+        )
+
+    db().table("app_movimientos").insert({
+        "codigo": codigo,
+        "tipo": tipo,
+        "cantidad": cantidad,
+        "documento": documento,
+        "nota": nota
+    }).execute()
+
+
+def historial_tipo(tipo):
+    m = movimientos()
+    if m.empty:
+        return pd.DataFrame(columns=["id", "fecha", "codigo", "descripcion", "tipo", "cantidad", "documento", "nota"])
+    m = m[m["tipo"] == tipo].copy()
+    p = productos()
+    if not p.empty:
+        m = m.merge(p[["codigo", "descripcion"]], on="codigo", how="left")
+    else:
+        m["descripcion"] = ""
+    m["cantidad"] = pd.to_numeric(m["cantidad"], errors="coerce")
+    return m[["id", "fecha", "codigo", "descripcion", "tipo", "cantidad", "documento", "nota"]].sort_values("id", ascending=False)
+
+
+def panel_historial(tipo, prefijo):
+    st.divider()
+    st.subheader("Historial de " + ("ingresos" if tipo == "INGRESO" else "salidas"))
+    h = historial_tipo(tipo)
+    if h.empty:
+        st.info("Todavía no hay movimientos de este tipo.")
+        return
+    codigos = ["TODOS"] + sorted(h["codigo"].dropna().astype(str).unique().tolist())
+    nombres = dict(zip(h["codigo"].astype(str), h["descripcion"].fillna(h["codigo"]).astype(str)))
+    filtro = st.selectbox("Filtrar por producto", codigos,
+        format_func=lambda c: "TODOS LOS PRODUCTOS" if c == "TODOS" else nombres.get(str(c), str(c)),
+        key=f"{prefijo}_filtro")
+    if filtro != "TODOS":
+        h = h[h["codigo"] == filtro]
+    st.dataframe(h, use_container_width=True, hide_index=True)
+    st.download_button(
+        "📥 Descargar solo " + ("ingresos" if tipo == "INGRESO" else "salidas") + " en Excel",
+        excel(h),
+        f"caferco_{prefijo}_{filtro.lower()}.xlsx",
+        key=f"{prefijo}_descargar"
+    )
+    if h.empty:
+        return
+    st.markdown("**Editar o eliminar un movimiento**")
+    opciones = {
+        int(r.id): f"ID {int(r.id)} | {r.descripcion or r.codigo} | {r.cantidad:g} | {r.documento or 'Sin documento'}"
+        for r in h.itertuples(index=False)
+    }
+    elegido = st.selectbox("Selecciona el movimiento", list(opciones),
+                           format_func=lambda x: opciones[x], key=f"{prefijo}_mov")
+    fila = h[h["id"] == elegido].iloc[0]
+    with st.form(f"{prefijo}_modificar"):
+        accion = st.radio("Acción", ["EDITAR", "ELIMINAR"], horizontal=True)
+        cantidad = st.number_input("Nueva cantidad (para editar)", min_value=0.001,
+                                   value=float(fila["cantidad"]), step=1.0,
+                                   format="%.3f")
+        motivo = st.text_input("Motivo de la corrección (obligatorio)")
+        confirmar = st.checkbox("Confirmo que revisé el movimiento y su efecto en el stock")
+        enviar = st.form_submit_button("Guardar corrección", type="primary")
+    if enviar:
+        if not confirmar:
+            st.error("Marca la casilla de confirmación.")
+        elif len(motivo.strip()) < 3:
+            st.error("Escribe un motivo de al menos 3 caracteres.")
+        else:
+            try:
+                db().rpc("app_modificar_movimiento", {
+                    "p_id": int(elegido),
+                    "p_accion": accion,
+                    "p_cantidad": float(cantidad) if accion == "EDITAR" else None,
+                    "p_motivo": motivo.strip()
+                }).execute()
+                st.success("Movimiento actualizado. El stock y el Kardex se recalcularán.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo modificar el movimiento: {e}")
+
+
+def excel(df):
+    b = io.BytesIO()
+    with pd.ExcelWriter(b, engine="openpyxl") as writer:
+        df.to_excel(writer, index=False, sheet_name="Datos")
+    return b.getvalue()
+
+
+def texto_pdf(archivo):
+    with fitz.open(
+        stream=archivo.getvalue(), filetype="pdf"
+    ) as pdf:
+        return "\n".join(
+            pagina.get_text(sort=True) for pagina in pdf
+        )
+
+
+def normalizar_nombre(valor):
+    texto = unicodedata.normalize("NFKD", str(valor).upper())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = texto.replace("×", "X").replace("½", "1/2")
+    texto = re.sub(r"[^A-Z0-9]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def detectar_candidatos_por_nombre(texto, catalogo):
+    """Solo compara descripciones, nunca códigos. Requiere cantidad explícita.
+
+    Formato reconocido: NOMBRE COMPLETO DEL PRODUCTO | 3
+    Las coincidencias dudosas se dejan para revisión manual.
+    """
+    descripciones = catalogo[["codigo", "descripcion"]].dropna().copy()
+    descripciones["normalizado"] = descripciones["descripcion"].map(normalizar_nombre)
+    grupos = descripciones.groupby("normalizado")
+    unicos = {
+        nombre: grupo.iloc[0]["descripcion"]
+        for nombre, grupo in grupos
+        if len(grupo) == 1 and nombre
+    }
+    encontrados = []
+    no_reconocidas = []
+    for linea in texto.splitlines():
+        original = linea.strip()
+        if not original:
+            continue
+        normal = normalizar_nombre(original)
+        posibles = []
+        for clave, descripcion in unicos.items():
+            # Se exige el nombre completo y una cantidad al final de la línea.
+            if normal.startswith(clave + " "):
+                resto = normal[len(clave):].strip()
+                if re.fullmatch(r"[0-9]+(?: [0-9]{1,3})?", resto):
+                    posibles.append((len(clave), descripcion, resto))
+        if posibles:
+            posibles.sort(reverse=True)
+            largo, descripcion, resto = posibles[0]
+            if len(posibles) > 1 and posibles[1][0] == largo:
+                no_reconocidas.append(original)
+                continue
+            # El número se obtiene del texto original para conservar decimales.
+            patron = re.compile(r"([0-9]+(?:[.,][0-9]{1,3})?)\s*$")
+            m = patron.search(original)
+            if m:
+                cantidad = float(m.group(1).replace(",", "."))
+                if cantidad > 0:
+                    encontrados.append({"nombre": descripcion, "cantidad": cantidad})
+                    continue
+        no_reconocidas.append(original)
+    return encontrados, no_reconocidas
+
+
+
+def mostrar_panel():
+    st.markdown("## 📊 Dashboard de inventario CAFERCO")
+    st.caption("Indicadores calculados con los registros actuales de Supabase. Los movimientos se comparan por unidad de medida.")
+
+    p = productos().copy()
+    m = movimientos().copy()
+    s = stock().copy()
+
+    if p.empty:
+        st.info("Registra productos para visualizar el dashboard.")
+        return
+
+    if not m.empty:
+        m["cantidad"] = pd.to_numeric(m["cantidad"], errors="coerce").fillna(0)
+        m["fecha_dt"] = pd.to_datetime(m["fecha"], errors="coerce", utc=True)
+        m = m.merge(
+            p[["codigo", "descripcion", "categoria", "unidad"]],
+            on="codigo", how="left"
+        )
+        m["descripcion"] = m["descripcion"].fillna(m["codigo"])
+        m["categoria"] = m["categoria"].fillna("SIN CATEGORÍA")
+        m["unidad"] = m["unidad"].fillna("SIN UNIDAD")
+
+    hoy = pd.Timestamp.now(tz="UTC")
+    st.markdown("#### Filtros del dashboard")
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        periodo = st.selectbox(
+            "Periodo",
+            ["Últimos 30 días", "Este mes", "Últimos 90 días", "Todo el historial"],
+            key="dash_periodo"
+        )
+    with f2:
+        categorias = sorted(p["categoria"].fillna("SIN CATEGORÍA").astype(str).unique())
+        categoria = st.selectbox("Categoría", ["TODAS"] + categorias, key="dash_categoria")
+    with f3:
+        unidades = sorted(p["unidad"].fillna("SIN UNIDAD").astype(str).unique())
+        unidad = st.selectbox("Unidad de medida", unidades, key="dash_unidad")
+
+    p_filtrados = p[p["unidad"].fillna("SIN UNIDAD") == unidad].copy()
+    if categoria != "TODAS":
+        p_filtrados = p_filtrados[
+            p_filtrados["categoria"].fillna("SIN CATEGORÍA") == categoria
+        ]
+    codigos = set(p_filtrados["codigo"])
+    s_filtrado = s[s["codigo"].isin(codigos)].copy()
+
+    if m.empty:
+        vista = m.copy()
+    else:
+        vista = m[m["codigo"].isin(codigos)].copy()
+        if periodo == "Últimos 30 días":
+            vista = vista[vista["fecha_dt"] >= hoy - pd.Timedelta(days=30)]
+        elif periodo == "Últimos 90 días":
+            vista = vista[vista["fecha_dt"] >= hoy - pd.Timedelta(days=90)]
+        elif periodo == "Este mes":
+            vista = vista[
+                (vista["fecha_dt"].dt.year == hoy.year) &
+                (vista["fecha_dt"].dt.month == hoy.month)
+            ]
+
+    entradas = ["INGRESO", "AJUSTE+"]
+    salidas = ["SALIDA", "AJUSTE-"]
+    cantidad_ingresos = float(vista.loc[vista["tipo"].isin(entradas), "cantidad"].sum()) if not vista.empty else 0
+    cantidad_salidas = float(vista.loc[vista["tipo"].isin(salidas), "cantidad"].sum()) if not vista.empty else 0
+    cantidad_stock = float(pd.to_numeric(s_filtrado["stock"], errors="coerce").fillna(0).sum()) if not s_filtrado.empty else 0
+    productos_movidos = int(vista["codigo"].nunique()) if not vista.empty else 0
+
+    k1, k2, k3, k4 = st.columns(4)
+    k1.metric("Stock actual", f"{cantidad_stock:,.2f} {unidad}")
+    k2.metric("Ingresos del periodo", f"{cantidad_ingresos:,.2f} {unidad}")
+    k3.metric("Salidas del periodo", f"{cantidad_salidas:,.2f} {unidad}")
+    k4.metric("Productos con movimiento", f"{productos_movidos:,}")
+    st.caption(
+        "El stock es el saldo actual, mientras que ingresos y salidas corresponden al periodo elegido. "
+        "Los ajustes se incluyen en sus respectivas direcciones."
+    )
+
+    t1, t2, t3 = st.tabs([
+        "🏆 Productos más movidos",
+        "📈 Tendencia de movimientos",
+        "📦 Stock y alertas"
+    ])
+
+    with t1:
+        st.subheader("Ranking de productos con mayor movimiento")
+        st.caption("Movimiento total = entradas + salidas, agrupadas por producto y en la misma unidad.")
+        if vista.empty:
+            st.info("No existen movimientos para estos filtros.")
+        else:
+            datos = vista[vista["tipo"].isin(entradas + salidas)].copy()
+            datos["Entradas"] = datos["cantidad"].where(datos["tipo"].isin(entradas), 0)
+            datos["Salidas"] = datos["cantidad"].where(datos["tipo"].isin(salidas), 0)
+            ranking = datos.groupby(["codigo", "descripcion"], as_index=False)[["Entradas", "Salidas"]].sum()
+            ranking["Movimiento total"] = ranking["Entradas"] + ranking["Salidas"]
+            ranking = ranking.sort_values("Movimiento total", ascending=False)
+            top = ranking.head(10).copy()
+            top["Producto"] = top["descripcion"] + " (" + top["codigo"].astype(str) + ")"
+            st.bar_chart(
+                top.set_index("Producto")[["Entradas", "Salidas"]],
+                horizontal=True,
+                use_container_width=True
+            )
+            st.dataframe(
+                ranking.rename(columns={"descripcion": "Producto", "codigo": "Código"}),
+                use_container_width=True,
+                hide_index=True
+            )
+            st.download_button(
+                "⬇️ Descargar ranking Excel",
+                excel(ranking),
+                file_name="caferco_ranking_productos.xlsx",
+                key="dash_ranking_excel"
+            )
+
+    with t2:
+        st.subheader("Evolución de ingresos y salidas")
+        if vista.empty or vista["fecha_dt"].isna().all():
+            st.info("No hay movimientos con fechas válidas para mostrar.")
+        else:
+            datos = vista[vista["tipo"].isin(entradas + salidas)].copy()
+            datos = datos.dropna(subset=["fecha_dt"])
+            if datos.empty:
+                st.info("No hay movimientos para estos filtros.")
+            else:
+                datos["Día"] = datos["fecha_dt"].dt.date
+                datos["Ingresos"] = datos["cantidad"].where(datos["tipo"].isin(entradas), 0)
+                datos["Salidas"] = datos["cantidad"].where(datos["tipo"].isin(salidas), 0)
+                diario = datos.groupby("Día", as_index=False)[["Ingresos", "Salidas"]].sum()
+                st.line_chart(diario.set_index("Día"), use_container_width=True)
+                st.download_button(
+                    "⬇️ Descargar tendencia Excel",
+                    excel(diario),
+                    file_name="caferco_tendencia_movimientos.xlsx",
+                    key="dash_tendencia_excel"
+                )
+
+    with t3:
+        st.subheader("Estado del stock por producto")
+        if s_filtrado.empty:
+            st.info("No hay productos en esta selección.")
+        else:
+            s_filtrado["stock"] = pd.to_numeric(
+                s_filtrado["stock"], errors="coerce"
+            ).fillna(0)
+            sin_stock = int((s_filtrado["stock"] <= 0).sum())
+            st.metric("Productos sin stock o con saldo negativo", sin_stock)
+            st.dataframe(
+                s_filtrado.sort_values("stock"),
+                use_container_width=True,
+                hide_index=True
+            )
+            st.caption(
+                "Las alertas de stock mínimo configurables se pueden añadir después; "
+                "por ahora se señalan productos con saldo cero o negativo."
+            )
+            st.download_button(
+                "⬇️ Descargar stock filtrado Excel",
+                excel(s_filtrado),
+                file_name="caferco_stock_dashboard.xlsx",
+                key="dash_stock_excel"
+            )
+
+def exigir_acceso():
+    try:
+        usuario_valido = str(
+            st.secrets["auth"]["username"]
+        )
+        clave_valida = str(
+            st.secrets["auth"]["password"]
+        )
+    except (KeyError, FileNotFoundError):
+        st.error(
+            "Configura [auth] con username y password "
+            "en Streamlit Secrets."
+        )
+        st.stop()
+
+    if not st.session_state.get("autenticado", False):
+        st.title("🔐 CAFERCO | Acceso privado")
+
+        with st.form("login"):
+            usuario = st.text_input("Usuario")
+            clave = st.text_input(
+                "Contraseña", type="password"
+            )
+            enviar = st.form_submit_button("Ingresar")
+
+        if enviar:
+            if (
+                hmac.compare_digest(usuario, usuario_valido)
+                and hmac.compare_digest(clave, clave_valida)
+            ):
+                st.session_state["autenticado"] = True
+                st.rerun()
+            else:
+                st.error("Usuario o contraseña incorrectos")
+
+        st.stop()
+
+    with st.sidebar:
+        st.caption("Sesión iniciada")
+        if st.button("Cerrar sesión"):
+            st.session_state["autenticado"] = False
+            st.rerun()
+
+
+exigir_acceso()
+
+st.title("📦 CAFERCO | Kardex e Inventario Interno")
+st.caption(
+    "Datos en Supabase · Revisar cada salida PDF "
+    "antes de descontar stock"
+)
+
+try:
+    db().table("app_productos").select(
+        "codigo"
+    ).limit(1).execute()
+except Exception as e:
+    st.error(
+        "No se pudo conectar al esquema caferco de Supabase. "
+        "Revisa URL, clave, esquema expuesto y permisos."
+    )
+    st.code(str(e))
+    st.stop()
+
+
+tabs = st.tabs([
+    "📈 Panel",
+    "📦 Productos",
+    "➕ Ingresos",
+    "📄 Salidas PDF",
+    "📊 Stock / Kardex",
+    "🧮 Inventario físico",
+    "⬇️ Respaldo"
+])
+
+
+with tabs[0]:
+    mostrar_panel()
+
+
+with tabs[1]:
+    st.subheader("Catálogo de productos")
+
+    with st.form("nuevo_producto", clear_on_submit=True):
+        c1, c2 = st.columns(2)
+
+        codigo = c1.text_input(
+            "Código único"
+        ).strip().upper()
+
+        descripcion = c2.text_input(
+            "Descripción / medida"
+        ).strip()
+
+        unidad = c1.selectbox(
+            "Unidad",
+            ["UND", "ROLLO", "KG", "CAJA", "M", "M2"]
+        )
+
+        categoria = c2.text_input(
+            "Categoría (mallas, clavos, alambres, etc.)"
+        ).strip()
+
+        guardar = st.form_submit_button("Guardar producto")
+
+    if guardar:
+        if not codigo or not descripcion:
+            st.error("Ingresa código y descripción")
+        else:
+            try:
+                db().table("app_productos").insert({
+                    "codigo": codigo,
+                    "descripcion": descripcion,
+                    "unidad": unidad,
+                    "categoria": categoria
+                }).execute()
+
+                st.success("Producto guardado")
+                st.rerun()
+
+            except Exception as e:
+                st.error(
+                    f"No se pudo guardar el producto: {e}"
+                )
+
+    st.dataframe(
+        productos(),
+        use_container_width=True,
+        hide_index=True
+    )
+
+
+with tabs[2]:
+    st.subheader("Registrar ingreso de mercadería")
+
+    p = productos()
+
+    if p.empty:
+        st.info("Primero registra un producto")
+    else:
+        etiquetas = {
+            r.codigo: f"{r.codigo} — {r.descripcion}"
+            for r in p.itertuples()
+        }
+
+        with st.form("ingreso", clear_on_submit=True):
+            codigo = st.selectbox(
+                "Producto",
+                list(etiquetas),
+                format_func=lambda c: etiquetas[c]
+            )
+
+            cantidad = st.number_input(
+                "Cantidad ingresada",
+                min_value=0.001,
+                value=1.0,
+                step=1.0,
+                format="%.3f"
+            )
+
+            documento = st.text_input(
+                "Guía / documento de ingreso"
+            )
+
+            nota = st.text_input("Observación")
+
+            enviar = st.form_submit_button(
+                "Registrar ingreso"
+            )
+
+        if enviar:
+            try:
+                registrar_movimiento(
+                    codigo,
+                    "INGRESO",
+                    cantidad,
+                    documento,
+                    nota
+                )
+
+                st.success("Ingreso registrado")
+                st.rerun()
+
+            except Exception as e:
+                st.error(
+                    f"No se pudo registrar: {e}"
+                )
+
+    panel_historial("INGRESO", "ingresos")
+
+
+with tabs[3]:
+    st.subheader(
+        "Salida por guía PDF — revisión obligatoria"
+    )
+
+    st.warning(
+        "La extracción del PDF puede equivocarse. "
+        "Comprueba manualmente códigos y cantidades "
+        "antes de confirmar."
+    )
+
+    p = productos()
+
+    if p.empty:
+        st.info(
+            "Registra productos antes de procesar salidas"
+        )
+    else:
+        archivo = st.file_uploader(
+            "Adjunta la guía PDF",
+            type=["pdf"]
+        )
+
+        numero = st.text_input(
+            "Número de guía / documento",
+            key="numero_guia"
+        ).strip()
+
+        if archivo:
+            huella = hashlib.sha256(
+                archivo.getvalue()
+            ).hexdigest()
+
+            st.caption(f"Archivo: {archivo.name}")
+
+            try:
+                texto = texto_pdf(archivo)
+
+                with st.expander(
+                    "Ver texto extraído del PDF"
+                ):
+                    st.text(
+                        texto[:15000]
+                        or "PDF sin texto seleccionable"
+                    )
+
+                if st.session_state.get("pdf_hash") != huella:
+                    st.session_state["pdf_hash"] = huella
+                    candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p)
+                    st.session_state["lineas_pdf"] = pd.DataFrame(candidatos, columns=["nombre", "cantidad"])
+                    st.session_state["lineas_no_reconocidas"] = no_reconocidas
+
+            except Exception as e:
+                st.error(
+                    f"No se pudo leer el PDF: {e}"
+                )
+                st.stop()
+
+            st.caption("La lectura automática busca NOMBRES completos, nunca códigos. Verifica cada línea antes de descontar stock.")
+            pendientes = st.session_state.get("lineas_no_reconocidas", [])
+            if pendientes:
+                with st.expander(f"Líneas no reconocidas automáticamente ({len(pendientes)})"):
+                    st.text("\n".join(pendientes[:150]))
+            st.caption("Puedes corregir, agregar o eliminar filas. Selecciona el nombre exacto del catálogo.")
+
+            editadas = st.data_editor(
+                st.session_state["lineas_pdf"],
+                num_rows="dynamic",
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "nombre": st.column_config.SelectboxColumn(
+                        "Nombre completo del producto",
+                        options=p["descripcion"].dropna().tolist(),
+                        required=True
+                    ),
+                    "cantidad": st.column_config.NumberColumn(
+                        "Cantidad",
+                        min_value=0.001,
+                        format="%.3f",
+                        required=True
+                    )
+                },
+                key=f"editor_pdf_{huella}"
+            )
+
+            st.subheader("Stock disponible")
+
+            st.dataframe(
+                stock(),
+                use_container_width=True,
+                hide_index=True
+            )
+
+            confirmar = st.checkbox(
+                "He revisado el PDF, los códigos, "
+                "las cantidades y el número de guía"
+            )
+
+            if st.button(
+                "Confirmar salida y descontar stock",
+                type="primary",
+                disabled=not confirmar
+            ):
+                try:
+                    if not numero:
+                        raise ValueError(
+                            "Escribe el número de guía"
+                        )
+
+                    if editadas.empty:
+                        raise ValueError(
+                            "Agrega al menos una línea"
+                        )
+
+                    if editadas[
+                        ["nombre", "cantidad"]
+                    ].isna().any().any():
+                        raise ValueError(
+                            "Hay códigos o cantidades vacíos"
+                        )
+
+                    lineas = []
+                    # Solo nombres únicos: no se adivina un código si hay descripciones duplicadas.
+                    conteos_nombres = p["descripcion"].value_counts()
+                    mapa_nombres = dict(zip(p["descripcion"], p["codigo"]))
+                    for fila in editadas.itertuples(index=False):
+                        nombre = str(fila.nombre)
+                        if nombre not in mapa_nombres or conteos_nombres[nombre] != 1:
+                            raise ValueError(f"Nombre no encontrado o duplicado: {nombre}. Corrige el catálogo antes de continuar.")
+                        if float(fila.cantidad) <= 0:
+                            raise ValueError("La cantidad debe ser mayor que cero")
+                        lineas.append({"codigo": str(mapa_nombres[nombre]), "cantidad": float(fila.cantidad)})
+
+                    db().rpc(
+                        "app_registrar_salida",
+                        {
+                            "p_clave": huella,
+                            "p_numero": numero,
+                            "p_archivo": archivo.name,
+                            "p_lineas": lineas
+                        }
+                    ).execute()
+
+                    st.success(
+                        "Salida registrada y stock "
+                        "descontado correctamente"
+                    )
+
+                    st.session_state.pop(
+                        "pdf_hash", None
+                    )
+                    st.session_state.pop("lineas_pdf", None)
+                    st.session_state.pop("lineas_no_reconocidas", None)
+
+                except Exception as e:
+                    st.error(
+                        f"No se registró la salida: {e}"
+                    )
+
+    panel_historial("SALIDA", "salidas")
+
+
+with tabs[4]:
+    st.subheader("Stock actualizado")
+
+    s = stock()
+
+    st.dataframe(
+        s,
+        use_container_width=True,
+        hide_index=True
+    )
+
+    st.download_button(
+        "Descargar stock Excel",
+        excel(s),
+        "stock_caferco.xlsx"
+    )
+
+    st.subheader("Kardex histórico")
+
+    k = kardex()
+
+    if not k.empty:
+        opciones = ["TODOS"] + sorted(
+            k["codigo"].dropna().unique().tolist()
+        )
+
+        nombres_k = dict(zip(k["codigo"].astype(str), k["descripcion"].fillna(k["codigo"]).astype(str)))
+        elegido = st.selectbox(
+            "Filtrar por producto", opciones,
+            format_func=lambda c: "TODOS LOS PRODUCTOS" if c == "TODOS" else nombres_k.get(str(c), str(c))
+        )
+
         if elegido != "TODOS":
             k = k[k["codigo"] == elegido]
 
