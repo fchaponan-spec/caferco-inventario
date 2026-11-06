@@ -169,6 +169,75 @@ def registrar_movimiento(
     }).execute()
 
 
+def historial_tipo(tipo):
+    m = movimientos()
+    if m.empty:
+        return pd.DataFrame(columns=["id", "fecha", "codigo", "descripcion", "tipo", "cantidad", "documento", "nota"])
+    m = m[m["tipo"] == tipo].copy()
+    p = productos()
+    if not p.empty:
+        m = m.merge(p[["codigo", "descripcion"]], on="codigo", how="left")
+    else:
+        m["descripcion"] = ""
+    m["cantidad"] = pd.to_numeric(m["cantidad"], errors="coerce")
+    return m[["id", "fecha", "codigo", "descripcion", "tipo", "cantidad", "documento", "nota"]].sort_values("id", ascending=False)
+
+
+def panel_historial(tipo, prefijo):
+    st.divider()
+    st.subheader("Historial de " + ("ingresos" if tipo == "INGRESO" else "salidas"))
+    h = historial_tipo(tipo)
+    if h.empty:
+        st.info("Todavía no hay movimientos de este tipo.")
+        return
+    codigos = ["TODOS"] + sorted(h["codigo"].dropna().astype(str).unique().tolist())
+    filtro = st.selectbox("Filtrar por producto", codigos, key=f"{prefijo}_filtro")
+    if filtro != "TODOS":
+        h = h[h["codigo"] == filtro]
+    st.dataframe(h, use_container_width=True, hide_index=True)
+    st.download_button(
+        "📥 Descargar solo " + ("ingresos" if tipo == "INGRESO" else "salidas") + " en Excel",
+        excel(h),
+        f"caferco_{prefijo}_{filtro.lower()}.xlsx",
+        key=f"{prefijo}_descargar"
+    )
+    if h.empty:
+        return
+    st.markdown("**Editar o eliminar un movimiento**")
+    opciones = {
+        int(r.id): f"ID {int(r.id)} | {r.codigo} | {r.cantidad:g} | {r.documento or 'Sin documento'}"
+        for r in h.itertuples(index=False)
+    }
+    elegido = st.selectbox("Selecciona el movimiento", list(opciones),
+                           format_func=lambda x: opciones[x], key=f"{prefijo}_mov")
+    fila = h[h["id"] == elegido].iloc[0]
+    with st.form(f"{prefijo}_modificar"):
+        accion = st.radio("Acción", ["EDITAR", "ELIMINAR"], horizontal=True)
+        cantidad = st.number_input("Nueva cantidad (para editar)", min_value=0.001,
+                                   value=float(fila["cantidad"]), step=1.0,
+                                   format="%.3f")
+        motivo = st.text_input("Motivo de la corrección (obligatorio)")
+        confirmar = st.checkbox("Confirmo que revisé el movimiento y su efecto en el stock")
+        enviar = st.form_submit_button("Guardar corrección", type="primary")
+    if enviar:
+        if not confirmar:
+            st.error("Marca la casilla de confirmación.")
+        elif len(motivo.strip()) < 3:
+            st.error("Escribe un motivo de al menos 3 caracteres.")
+        else:
+            try:
+                db().rpc("app_modificar_movimiento", {
+                    "p_id": int(elegido),
+                    "p_accion": accion,
+                    "p_cantidad": float(cantidad) if accion == "EDITAR" else None,
+                    "p_motivo": motivo.strip()
+                }).execute()
+                st.success("Movimiento actualizado. El stock y el Kardex se recalcularán.")
+                st.rerun()
+            except Exception as e:
+                st.error(f"No se pudo modificar el movimiento: {e}")
+
+
 def excel(df):
     b = io.BytesIO()
     with pd.ExcelWriter(b, engine="openpyxl") as writer:
@@ -392,6 +461,8 @@ with tabs[1]:
                     f"No se pudo registrar: {e}"
                 )
 
+    panel_historial("INGRESO", "ingresos")
+
 
 with tabs[2]:
     st.subheader(
@@ -564,6 +635,8 @@ with tabs[2]:
                     st.error(
                         f"No se registró la salida: {e}"
                     )
+
+    panel_historial("SALIDA", "salidas")
 
 
 with tabs[3]:
