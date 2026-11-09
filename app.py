@@ -267,46 +267,67 @@ def normalizar_nombre(valor):
 
 
 def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
-    """Extrae cada artículo y cantidad del PDF, incluso si no coincide con catálogo."""
+    """Lee filas ITM CODIGO DESCRIPCION CANTIDAD U.M. de notas CAFERCO.
+
+    La cantidad se extrae de la columna CANTIDAD, no de precios ni medidas.
+    Las continuaciones de descripción en la línea siguiente se incorporan.
+    """
     encontrados, pendientes = [], []
-    if archivo is None:
-        return encontrados, ["Adjunta un PDF"]
+    if not texto or not texto.strip():
+        return encontrados, ["PDF sin texto seleccionable; revisa el documento manualmente."]
+
     catalogo = catalogo.copy()
     catalogo["clave_nombre"] = catalogo["descripcion"].map(normalizar_nombre)
-    with fitz.open(stream=archivo.getvalue(), filetype="pdf") as doc:
-        for pagina in doc:
-            bloques = pagina.get_text("blocks")
-            detalles, cantidades = [], []
-            for bloque in bloques:
-                x0, y0, x1, y1, contenido = bloque[:5]
-                if "TOTAL" in contenido.upper() or "ITM\nCODIGO" in contenido.upper():
-                    continue
-                if x0 < pagina.rect.width * .60:
-                    match = re.match(r"^\s*(\d{1,3})\s*\n\s*([A-Z0-9-]{2,})\s*\n(.+)$", contenido, re.S)
-                    if match and "MALLA" in contenido.upper():
-                        detalles.append((y0, match.group(2), " ".join(match.group(3).split())))
-                else:
-                    match = re.search(r"(?<!\d)(\d+(?:[.,]\d+)?)\s*(ROLLO|UND|KG|CAJA|PAQ|BOLSA)\b", contenido.upper())
-                    if match:
-                        cantidades.append((y0, float(match.group(1).replace(",", ".")), match.group(2)))
-            usados = set()
-            for y, codigo_impreso, descripcion in detalles:
-                opciones = [(i, abs(cy-y), cantidad, unidad) for i,(cy,cantidad,unidad) in enumerate(cantidades) if i not in usados and abs(cy-y) < 15]
-                if not opciones:
-                    pendientes.append(f"{descripcion}: cantidad no detectada")
-                    continue
-                i, _, cantidad, unidad = min(opciones, key=lambda z:z[1])
-                usados.add(i)
-                clave = normalizar_nombre(descripcion)
-                iguales = catalogo[catalogo["clave_nombre"] == clave]
-                # Los códigos de la guía son auxiliares; solo se usan para
-                # verificar una coincidencia cuyo nombre es suficientemente similar.
-                if len(iguales) == 1 and str(iguales.iloc[0]["unidad"]).upper() == unidad:
-                    nombre = str(iguales.iloc[0]["descripcion"])
-                else:
-                    nombre = None
-                    pendientes.append(f"{descripcion} | {cantidad:g} {unidad} | Código impreso {codigo_impreso}: selecciona el nombre correcto del catálogo")
-                encontrados.append({"nombre": nombre, "cantidad": cantidad, "descripcion_pdf": descripcion, "codigo_pdf": codigo_impreso})
+    lineas = texto.splitlines()
+    inicio = next((i + 1 for i, linea in enumerate(lineas)
+                   if re.search(r"\bITM\s+CODIGO\b", linea.upper())), None)
+    if inicio is None:
+        return encontrados, ["No se encontró el encabezado ITM CODIGO de la guía."]
+
+    # Cada artículo comienza con número de ítem y código impreso.
+    patron_item = re.compile(r"^\s*(\d{1,3})\s+([A-Z0-9-]{2,})\s+(.+)$")
+    patron_cantidad = re.compile(
+        r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(ROLLOS?|UND|UNID(?:AD(?:ES)?)?|KG|KGS|CAJAS?|PAQ|BOLSAS?)\b",
+        re.IGNORECASE
+    )
+    filas = []
+    for linea in lineas[inicio:]:
+        if re.search(r"^\s*(?:SON:|TOTAL\b|EXIJA\b|Powered by\b)", linea, re.IGNORECASE):
+            break
+        match = patron_item.match(linea)
+        if match:
+            cantidad_match = patron_cantidad.search(match.group(3))
+            if cantidad_match:
+                descripcion = match.group(3)[:cantidad_match.start()].strip()
+                cantidad = float(cantidad_match.group(1).replace(",", "."))
+                unidad = cantidad_match.group(2).upper()
+                unidad = {"ROLLOS":"ROLLO", "KGS":"KG", "CAJAS":"CAJA", "BOLSAS":"BOLSA", "UNIDAD":"UND", "UNIDADES":"UND", "UNID":"UND"}.get(unidad, unidad)
+                filas.append({"codigo_pdf": match.group(2), "descripcion_pdf": descripcion,
+                              "cantidad": cantidad, "unidad_pdf": unidad})
+                continue
+        # Continuación de la descripción (por ejemplo, el segundo '3' en '3 X 3').
+        if filas and linea.strip() and not patron_cantidad.search(linea):
+            filas[-1]["descripcion_pdf"] += " " + linea.strip()
+
+    for fila in filas:
+        descripcion = " ".join(fila["descripcion_pdf"].split())
+        cantidad = fila["cantidad"]
+        unidad = fila["unidad_pdf"]
+        clave = normalizar_nombre(descripcion)
+        iguales = catalogo[
+            (catalogo["clave_nombre"] == clave) &
+            (catalogo["unidad"].astype(str).str.upper() == unidad)
+        ]
+        nombre = str(iguales.iloc[0]["descripcion"]) if len(iguales) == 1 else None
+        if nombre is None:
+            pendientes.append(
+                f"{descripcion} | {cantidad:g} {unidad}: selecciona el producto correcto del catálogo"
+            )
+        encontrados.append({"nombre": nombre, "cantidad": cantidad,
+                            "descripcion_pdf": descripcion, "codigo_pdf": fila["codigo_pdf"]})
+
+    if not encontrados:
+        pendientes.append("No se identificaron artículos con cantidad. Revisa el texto extraído del PDF.")
     return encontrados, pendientes
 
 
@@ -806,7 +827,8 @@ with tabs[3]:
                         or "PDF sin texto seleccionable"
                     )
 
-                if st.session_state.get("pdf_hash") != huella or st.session_state.get("pdf_catalogo") != hashlib.sha256(p.to_json().encode()).hexdigest():
+                if st.session_state.get("pdf_parser_version") != 3 or st.session_state.get("pdf_hash") != huella or st.session_state.get("pdf_catalogo") != hashlib.sha256(p.to_json().encode()).hexdigest():
+                    st.session_state["pdf_parser_version"] = 3
                     st.session_state["pdf_hash"] = huella
                     st.session_state["pdf_catalogo"] = hashlib.sha256(p.to_json().encode()).hexdigest()
                     candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p, archivo)
