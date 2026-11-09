@@ -267,66 +267,46 @@ def normalizar_nombre(valor):
 
 
 def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
-    """Lee renglones de nota de venta CAFERCO usando columnas del PDF.
-
-    Los codigos impresos son pistas de verificacion, no son necesarios
-    para identificar por nombre. No inventa productos faltantes.
-    """
+    """Extrae cada artículo y cantidad del PDF, incluso si no coincide con catálogo."""
     encontrados, pendientes = [], []
     if archivo is None:
-        return encontrados, ["Se requiere el PDF para leer las columnas de la guía"]
-
+        return encontrados, ["Adjunta un PDF"]
     catalogo = catalogo.copy()
     catalogo["clave_nombre"] = catalogo["descripcion"].map(normalizar_nombre)
-
-    def nombre_equivalente(x):
-        x = normalizar_nombre(x)
-        # Normaliza fracciones y espaciados sin eliminar el atributo M/C.
-        x = re.sub(r"(?<![0-9])2\s+1\s+2(?![0-9])", "2 1 2", x)
-        return x
-
     with fitz.open(stream=archivo.getvalue(), filetype="pdf") as doc:
         for pagina in doc:
             bloques = pagina.get_text("blocks")
-            # La primera columna del detalle comienza con ITEM y CODIGO;
-            # el texto del producto puede ocupar varias lineas.
-            detalles = []
-            cantidades = []
+            detalles, cantidades = [], []
             for bloque in bloques:
                 x0, y0, x1, y1, contenido = bloque[:5]
-                if y0 < 100 or "TOTAL" in contenido.upper():
+                if "TOTAL" in contenido.upper() or "ITM\nCODIGO" in contenido.upper():
                     continue
                 if x0 < pagina.rect.width * .60:
                     match = re.match(r"^\s*(\d{1,3})\s*\n\s*([A-Z0-9-]{2,})\s*\n(.+)$", contenido, re.S)
                     if match and "MALLA" in contenido.upper():
-                        descripcion = " ".join(match.group(3).split())
-                        detalles.append((y0, match.group(2), descripcion))
+                        detalles.append((y0, match.group(2), " ".join(match.group(3).split())))
                 else:
-                    cantidad = re.search(r"(?<!\d)(\d+(?:[.,]\d+)?)\s*(ROLLO|UND|KG|CAJA|PAQ|BOLSA)\b", contenido.upper())
-                    if cantidad:
-                        cantidades.append((y0, float(cantidad.group(1).replace(",", ".")), cantidad.group(2)))
+                    match = re.search(r"(?<!\d)(\d+(?:[.,]\d+)?)\s*(ROLLO|UND|KG|CAJA|PAQ|BOLSA)\b", contenido.upper())
+                    if match:
+                        cantidades.append((y0, float(match.group(1).replace(",", ".")), match.group(2)))
             usados = set()
             for y, codigo_impreso, descripcion in detalles:
-                opciones = [(i, abs(cy-y), cantidad, unidad) for i,(cy,cantidad,unidad) in enumerate(cantidades) if i not in usados and abs(cy-y) < 12]
+                opciones = [(i, abs(cy-y), cantidad, unidad) for i,(cy,cantidad,unidad) in enumerate(cantidades) if i not in usados and abs(cy-y) < 15]
                 if not opciones:
-                    pendientes.append(f"{descripcion} | Cantidad no identificada")
+                    pendientes.append(f"{descripcion}: cantidad no detectada")
                     continue
                 i, _, cantidad, unidad = min(opciones, key=lambda z:z[1])
                 usados.add(i)
-                clave = nombre_equivalente(descripcion)
-                coincidencias = catalogo[catalogo["clave_nombre"].map(nombre_equivalente) == clave]
-                if len(coincidencias) == 1:
-                    producto = coincidencias.iloc[0]
-                    # Si existe un codigo impreso, verificar consistencia.
-                    # Un cambio de codigo en el catalogo es posible; no se exige igualdad.
-                    if str(producto["unidad"]).upper() != unidad:
-                        pendientes.append(f"{descripcion} | {cantidad:g} {unidad} | Unidad distinta en catálogo")
-                    else:
-                        encontrados.append({"nombre": str(producto["descripcion"]), "cantidad": cantidad})
-                elif len(coincidencias) > 1:
-                    pendientes.append(f"{descripcion} | {cantidad:g} {unidad} | Nombre duplicado en catálogo")
+                clave = normalizar_nombre(descripcion)
+                iguales = catalogo[catalogo["clave_nombre"] == clave]
+                # Los códigos de la guía son auxiliares; solo se usan para
+                # verificar una coincidencia cuyo nombre es suficientemente similar.
+                if len(iguales) == 1 and str(iguales.iloc[0]["unidad"]).upper() == unidad:
+                    nombre = str(iguales.iloc[0]["descripcion"])
                 else:
-                    pendientes.append(f"{descripcion} | {cantidad:g} {unidad} | No existe en catálogo (código de guía {codigo_impreso})")
+                    nombre = None
+                    pendientes.append(f"{descripcion} | {cantidad:g} {unidad} | Código impreso {codigo_impreso}: selecciona el nombre correcto del catálogo")
+                encontrados.append({"nombre": nombre, "cantidad": cantidad, "descripcion_pdf": descripcion, "codigo_pdf": codigo_impreso})
     return encontrados, pendientes
 
 
@@ -804,6 +784,7 @@ with tabs[3]:
 
         numero = st.text_input(
             "Número de guía / documento",
+            value=archivo.name.rsplit(".", 1)[0] if archivo else "",
             key="numero_guia"
         ).strip()
 
@@ -829,7 +810,7 @@ with tabs[3]:
                     st.session_state["pdf_hash"] = huella
                     st.session_state["pdf_catalogo"] = hashlib.sha256(p.to_json().encode()).hexdigest()
                     candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p, archivo)
-                    st.session_state["lineas_pdf"] = pd.DataFrame(candidatos, columns=["nombre", "cantidad"])
+                    st.session_state["lineas_pdf"] = pd.DataFrame(candidatos, columns=["nombre", "cantidad", "descripcion_pdf", "codigo_pdf"])
                     st.session_state["lineas_no_reconocidas"] = no_reconocidas
 
             except Exception as e:
@@ -843,7 +824,7 @@ with tabs[3]:
             if pendientes:
                 with st.expander(f"Líneas no reconocidas automáticamente ({len(pendientes)})"):
                     st.text("\n".join(pendientes[:150]))
-            st.caption("Puedes corregir, agregar o eliminar filas. Selecciona el nombre exacto del catálogo.")
+            st.caption("Revisa cada descripción del PDF y selecciona el producto del catálogo si aparece vacío. Ninguna salida se descuenta sin tu confirmación.")
 
             editadas = st.data_editor(
                 st.session_state["lineas_pdf"],
@@ -857,13 +838,12 @@ with tabs[3]:
                         required=True
                     ),
                     "cantidad": st.column_config.NumberColumn(
-                        "Cantidad",
-                        min_value=0.001,
-                        format="%.3f",
-                        required=True
-                    )
+                        "Cantidad", min_value=0.001, format="%.3f", required=True
+                    ),
+                    "descripcion_pdf": st.column_config.TextColumn("Descripción leída del PDF", disabled=True),
+                    "codigo_pdf": st.column_config.TextColumn("Código impreso (referencia)", disabled=True)
                 },
-                key=f"editor_pdf_{huella}"
+                key=f"editor_pdf_{huella}_{st.session_state.get('pdf_catalogo', '')[:10]}"
             )
 
             st.subheader("Stock disponible")
@@ -890,13 +870,6 @@ with tabs[3]:
                             "Escribe el número de guía"
                         )
 
-                    if st.session_state.get("lineas_no_reconocidas"):
-                        raise ValueError(
-                            "Hay productos de la guía sin reconocer. "
-                            "Regístralos en el catálogo y vuelve a cargar el PDF "
-                            "antes de confirmar para evitar salidas incompletas."
-                        )
-
                     if editadas.empty:
                         raise ValueError(
                             "Agrega al menos una línea"
@@ -906,7 +879,7 @@ with tabs[3]:
                         ["nombre", "cantidad"]
                     ].isna().any().any():
                         raise ValueError(
-                            "Hay nombres o cantidades vacíos"
+                            "Hay productos sin identificar. Selecciona su nombre en el catálogo antes de confirmar; si falta, regístralo primero."
                         )
 
                     lineas = []
