@@ -266,51 +266,68 @@ def normalizar_nombre(valor):
     return " ".join(texto.split())
 
 
-def detectar_candidatos_por_nombre(texto, catalogo):
-    """Solo compara descripciones, nunca códigos. Requiere cantidad explícita.
+def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
+    """Lee renglones de nota de venta CAFERCO usando columnas del PDF.
 
-    Formato reconocido: NOMBRE COMPLETO DEL PRODUCTO | 3
-    Las coincidencias dudosas se dejan para revisión manual.
+    Los codigos impresos son pistas de verificacion, no son necesarios
+    para identificar por nombre. No inventa productos faltantes.
     """
-    descripciones = catalogo[["codigo", "descripcion"]].dropna().copy()
-    descripciones["normalizado"] = descripciones["descripcion"].map(normalizar_nombre)
-    grupos = descripciones.groupby("normalizado")
-    unicos = {
-        nombre: grupo.iloc[0]["descripcion"]
-        for nombre, grupo in grupos
-        if len(grupo) == 1 and nombre
-    }
-    encontrados = []
-    no_reconocidas = []
-    for linea in texto.splitlines():
-        original = linea.strip()
-        if not original:
-            continue
-        normal = normalizar_nombre(original)
-        posibles = []
-        for clave, descripcion in unicos.items():
-            # Se exige el nombre completo y una cantidad al final de la línea.
-            if normal.startswith(clave + " "):
-                resto = normal[len(clave):].strip()
-                if re.fullmatch(r"[0-9]+(?: [0-9]{1,3})?", resto):
-                    posibles.append((len(clave), descripcion, resto))
-        if posibles:
-            posibles.sort(reverse=True)
-            largo, descripcion, resto = posibles[0]
-            if len(posibles) > 1 and posibles[1][0] == largo:
-                no_reconocidas.append(original)
-                continue
-            # El número se obtiene del texto original para conservar decimales.
-            patron = re.compile(r"([0-9]+(?:[.,][0-9]{1,3})?)\s*$")
-            m = patron.search(original)
-            if m:
-                cantidad = float(m.group(1).replace(",", "."))
-                if cantidad > 0:
-                    encontrados.append({"nombre": descripcion, "cantidad": cantidad})
-                    continue
-        no_reconocidas.append(original)
-    return encontrados, no_reconocidas
+    encontrados, pendientes = [], []
+    if archivo is None:
+        return encontrados, ["Se requiere el PDF para leer las columnas de la guía"]
 
+    catalogo = catalogo.copy()
+    catalogo["clave_nombre"] = catalogo["descripcion"].map(normalizar_nombre)
+
+    def nombre_equivalente(x):
+        x = normalizar_nombre(x)
+        # Normaliza fracciones y espaciados sin eliminar el atributo M/C.
+        x = re.sub(r"(?<![0-9])2\s+1\s+2(?![0-9])", "2 1 2", x)
+        return x
+
+    with fitz.open(stream=archivo.getvalue(), filetype="pdf") as doc:
+        for pagina in doc:
+            bloques = pagina.get_text("blocks")
+            # La primera columna del detalle comienza con ITEM y CODIGO;
+            # el texto del producto puede ocupar varias lineas.
+            detalles = []
+            cantidades = []
+            for bloque in bloques:
+                x0, y0, x1, y1, contenido = bloque[:5]
+                if y0 < 100 or "TOTAL" in contenido.upper():
+                    continue
+                if x0 < pagina.rect.width * .60:
+                    match = re.match(r"^\s*(\d{1,3})\s*\n\s*([A-Z0-9-]{2,})\s*\n(.+)$", contenido, re.S)
+                    if match and "MALLA" in contenido.upper():
+                        descripcion = " ".join(match.group(3).split())
+                        detalles.append((y0, match.group(2), descripcion))
+                else:
+                    cantidad = re.search(r"(?<!\d)(\d+(?:[.,]\d+)?)\s*(ROLLO|UND|KG|CAJA|PAQ|BOLSA)\b", contenido.upper())
+                    if cantidad:
+                        cantidades.append((y0, float(cantidad.group(1).replace(",", ".")), cantidad.group(2)))
+            usados = set()
+            for y, codigo_impreso, descripcion in detalles:
+                opciones = [(i, abs(cy-y), cantidad, unidad) for i,(cy,cantidad,unidad) in enumerate(cantidades) if i not in usados and abs(cy-y) < 12]
+                if not opciones:
+                    pendientes.append(f"{descripcion} | Cantidad no identificada")
+                    continue
+                i, _, cantidad, unidad = min(opciones, key=lambda z:z[1])
+                usados.add(i)
+                clave = nombre_equivalente(descripcion)
+                coincidencias = catalogo[catalogo["clave_nombre"].map(nombre_equivalente) == clave]
+                if len(coincidencias) == 1:
+                    producto = coincidencias.iloc[0]
+                    # Si existe un codigo impreso, verificar consistencia.
+                    # Un cambio de codigo en el catalogo es posible; no se exige igualdad.
+                    if str(producto["unidad"]).upper() != unidad:
+                        pendientes.append(f"{descripcion} | {cantidad:g} {unidad} | Unidad distinta en catálogo")
+                    else:
+                        encontrados.append({"nombre": str(producto["descripcion"]), "cantidad": cantidad})
+                elif len(coincidencias) > 1:
+                    pendientes.append(f"{descripcion} | {cantidad:g} {unidad} | Nombre duplicado en catálogo")
+                else:
+                    pendientes.append(f"{descripcion} | {cantidad:g} {unidad} | No existe en catálogo (código de guía {codigo_impreso})")
+    return encontrados, pendientes
 
 
 def mostrar_panel():
@@ -769,7 +786,7 @@ with tabs[3]:
 
     st.warning(
         "La extracción del PDF puede equivocarse. "
-        "Comprueba manualmente códigos y cantidades "
+        "Comprueba manualmente nombres y cantidades "
         "antes de confirmar."
     )
 
@@ -808,9 +825,10 @@ with tabs[3]:
                         or "PDF sin texto seleccionable"
                     )
 
-                if st.session_state.get("pdf_hash") != huella:
+                if st.session_state.get("pdf_hash") != huella or st.session_state.get("pdf_catalogo") != hashlib.sha256(p.to_json().encode()).hexdigest():
                     st.session_state["pdf_hash"] = huella
-                    candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p)
+                    st.session_state["pdf_catalogo"] = hashlib.sha256(p.to_json().encode()).hexdigest()
+                    candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p, archivo)
                     st.session_state["lineas_pdf"] = pd.DataFrame(candidatos, columns=["nombre", "cantidad"])
                     st.session_state["lineas_no_reconocidas"] = no_reconocidas
 
@@ -820,7 +838,7 @@ with tabs[3]:
                 )
                 st.stop()
 
-            st.caption("La lectura automática busca NOMBRES completos, nunca códigos. Verifica cada línea antes de descontar stock.")
+            st.caption("La lectura identifica NOMBRES y CANTIDADES en las columnas de la guía. Los códigos impresos solo ayudan a verificar. Revisa todo antes de descontar.")
             pendientes = st.session_state.get("lineas_no_reconocidas", [])
             if pendientes:
                 with st.expander(f"Líneas no reconocidas automáticamente ({len(pendientes)})"):
@@ -857,7 +875,7 @@ with tabs[3]:
             )
 
             confirmar = st.checkbox(
-                "He revisado el PDF, los códigos, "
+                "He revisado el PDF, los nombres, "
                 "las cantidades y el número de guía"
             )
 
@@ -872,6 +890,13 @@ with tabs[3]:
                             "Escribe el número de guía"
                         )
 
+                    if st.session_state.get("lineas_no_reconocidas"):
+                        raise ValueError(
+                            "Hay productos de la guía sin reconocer. "
+                            "Regístralos en el catálogo y vuelve a cargar el PDF "
+                            "antes de confirmar para evitar salidas incompletas."
+                        )
+
                     if editadas.empty:
                         raise ValueError(
                             "Agrega al menos una línea"
@@ -881,7 +906,7 @@ with tabs[3]:
                         ["nombre", "cantidad"]
                     ].isna().any().any():
                         raise ValueError(
-                            "Hay códigos o cantidades vacíos"
+                            "Hay nombres o cantidades vacíos"
                         )
 
                     lineas = []
@@ -914,6 +939,7 @@ with tabs[3]:
                     st.session_state.pop(
                         "pdf_hash", None
                     )
+                    st.session_state.pop("pdf_catalogo", None)
                     st.session_state.pop("lineas_pdf", None)
                     st.session_state.pop("lineas_no_reconocidas", None)
 
