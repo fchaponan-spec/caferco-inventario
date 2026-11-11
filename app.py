@@ -723,59 +723,70 @@ with tabs[1]:
 
 with tabs[2]:
     st.subheader("Registrar ingreso de mercadería")
+    st.info("Selecciona el producto y escribe la cantidad. No se registrará nada sin tu confirmación.")
 
     p = productos()
-
     if p.empty:
-        st.info("Primero registra un producto")
+        st.info("Primero registra un producto.")
     else:
         etiquetas = {
-            r.codigo: f"{r.codigo} — {r.descripcion}"
+            str(r.codigo): f"{r.descripcion} — {r.codigo}"
             for r in p.itertuples()
         }
-
-        with st.form("ingreso", clear_on_submit=True):
-            codigo = st.selectbox(
+        with st.form("ingreso_seguro", clear_on_submit=True):
+            codigo_ingreso = st.selectbox(
                 "Producto",
-                list(etiquetas),
+                options=list(etiquetas.keys()),
+                index=None,
+                placeholder="Seleccione un producto",
                 format_func=lambda c: etiquetas[c]
             )
-
-            cantidad = st.number_input(
+            cantidad_texto = st.text_input(
                 "Cantidad ingresada",
-                min_value=0.001,
-                value=1.0,
-                step=1.0,
-                format="%.3f"
+                value="",
+                placeholder="Escribe la cantidad real (ejemplo: 12)"
+            )
+            documento_ingreso = st.text_input("Guía / documento de ingreso")
+            nota_ingreso = st.text_input("Observación")
+            confirmar_ingreso = st.checkbox(
+                "Confirmo que revisé el producto y la cantidad ingresada"
+            )
+            enviar_ingreso = st.form_submit_button(
+                "Registrar ingreso", type="primary"
             )
 
-            documento = st.text_input(
-                "Guía / documento de ingreso"
-            )
-
-            nota = st.text_input("Observación")
-
-            enviar = st.form_submit_button(
-                "Registrar ingreso"
-            )
-
-        if enviar:
+        if enviar_ingreso:
             try:
+                if codigo_ingreso is None:
+                    raise ValueError("Debes seleccionar un producto.")
+                if not cantidad_texto.strip():
+                    raise ValueError("Debes escribir la cantidad ingresada.")
+                try:
+                    cantidad_ingreso = float(cantidad_texto.strip().replace(",", "."))
+                except ValueError:
+                    raise ValueError("Escribe una cantidad numérica válida.")
+                import math
+                if not math.isfinite(cantidad_ingreso) or cantidad_ingreso <= 0:
+                    raise ValueError("La cantidad debe ser un número mayor que cero.")
+                if not confirmar_ingreso:
+                    raise ValueError("Debes marcar la confirmación antes de guardar.")
+
                 registrar_movimiento(
-                    codigo,
+                    codigo_ingreso,
                     "INGRESO",
-                    cantidad,
-                    documento,
-                    nota
+                    cantidad_ingreso,
+                    documento_ingreso.strip(),
+                    nota_ingreso.strip()
                 )
-
-                st.success("Ingreso registrado")
+                st.success(
+                    f"Ingreso registrado: {etiquetas[codigo_ingreso]} "
+                    f"— {cantidad_ingreso:g}"
+                )
                 st.rerun()
-
+            except ValueError as e:
+                st.error(str(e))
             except Exception as e:
-                st.error(
-                    f"No se pudo registrar: {e}"
-                )
+                st.error(f"No se pudo registrar: {e}")
 
     panel_historial("INGRESO", "ingresos")
 
