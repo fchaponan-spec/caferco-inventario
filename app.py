@@ -268,13 +268,20 @@ def normalizar_nombre(valor):
 
 
 def clave_producto_flexible(valor):
-    """Normaliza variantes tipográficas sin borrar medidas ni números."""
-    texto = unicodedata.normalize("NFKD", str(valor).upper())
+    """Normaliza presentación sin perder números, calibres ni dimensiones."""
+    texto = str(valor).upper().strip()
+    texto = texto.replace("½", " 1/2").replace("¼", " 1/4").replace("¾", " 3/4")
+    texto = texto.replace("×", "X").replace("⁄", "/")
+    texto = unicodedata.normalize("NFKD", texto)
     texto = "".join(c for c in texto if not unicodedata.combining(c))
-    texto = texto.replace("½", " 1/2").replace("×", "X")
-    texto = re.sub(r"(?<=\d)\s*1/2", ".5", texto)
-    texto = re.sub(r"\b(PAQUETE|PAQUETES)\b", "PQT", texto)
-    texto = re.sub(r"[^A-Z0-9]+", " ", texto)
+    texto = re.sub(r"(?<=\d)\s+1/2\b", ".5", texto)
+    texto = re.sub(r"(?<=\d)\s+1/4\b", ".25", texto)
+    texto = re.sub(r"(?<=\d)\s+3/4\b", ".75", texto)
+    texto = re.sub(r"\b(PAQUETES?|PAQ)\b", "PQT", texto)
+    texto = re.sub(r"\b(UNIDADES?|UNID)\b", "UND", texto)
+    texto = re.sub(r"\b(ROLLOS)\b", "ROLLO", texto)
+    texto = re.sub(r"\b(C\s*/\s*)", "CON ", texto)
+    texto = re.sub(r"[^A-Z0-9.]+", " ", texto)
     return " ".join(texto.split())
 
 
@@ -284,6 +291,49 @@ def unidad_equivalente(valor):
             "UNID":"UND", "PAQ":"PQT", "PAQUETE":"PQT",
             "PAQUETES":"PQT", "CAJAS":"CAJA", "BOLSAS":"BOLSA",
             "KGS":"KG"}.get(u, u)
+
+
+def numeros_producto(valor):
+    """Protege calibres y medidas contra coincidencias falsas."""
+    return re.findall(r"(?<![A-Z])\d+(?:\.\d+)?", clave_producto_flexible(valor))
+
+
+def asociar_producto_catalogo(descripcion, unidad, codigo_pdf, catalogo):
+    """Busca por nombre; el código de la guía solo confirma candidatos compatibles."""
+    clave = clave_producto_flexible(descripcion)
+    compatibles = catalogo[catalogo["clave_unidad"] == unidad_equivalente(unidad)]
+    if compatibles.empty:
+        return None
+    exactos = compatibles[compatibles["clave_nombre"] == clave]
+    if len(exactos) == 1:
+        return str(exactos.iloc[0]["descripcion"])
+    if len(exactos) > 1:
+        return None
+
+    # Si la descripción varía ligeramente, un código igual es una corroboración,
+    # nunca el único criterio. Se exige también similitud de nombre y unidad.
+    por_codigo = compatibles[compatibles["codigo"].astype(str).str.strip().str.upper() == str(codigo_pdf).strip().upper()]
+    if len(por_codigo) == 1:
+        candidato = por_codigo.iloc[0]
+        similitud = SequenceMatcher(None, clave, str(candidato["clave_nombre"])).ratio()
+        if similitud >= 0.70 and numeros_producto(descripcion) == numeros_producto(candidato["descripcion"]):
+            return str(candidato["descripcion"])
+
+    # Para diferencias de puntuación y abreviaturas, emparejar solo si es
+    # inequívoco y conserva exactamente las cifras (calibres, medidas, etc.).
+    opciones = []
+    numeros = numeros_producto(descripcion)
+    for r in compatibles.itertuples():
+        if numeros != numeros_producto(r.descripcion):
+            continue
+        ratio = SequenceMatcher(None, clave, str(r.clave_nombre)).ratio()
+        opciones.append((ratio, str(r.descripcion)))
+    opciones.sort(reverse=True)
+    if opciones and opciones[0][0] >= 0.90 and (
+        len(opciones) == 1 or opciones[0][0] - opciones[1][0] >= 0.10
+    ):
+        return opciones[0][1]
+    return None
 
 
 def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
@@ -356,21 +406,9 @@ def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
 
     for fila in filas:
         descripcion = " ".join(fila["descripcion_pdf"].split())
-        clave = clave_producto_flexible(descripcion)
-        compatibles = catalogo[catalogo["clave_unidad"] == unidad_equivalente(fila["unidad_pdf"])]
-        iguales = compatibles[compatibles["clave_nombre"] == clave]
-        nombre = str(iguales.iloc[0]["descripcion"]) if len(iguales) == 1 else None
-        # Solo autoseleccionar una variante casi idéntica, inequívoca.
-        # Nunca usar únicamente el código impreso para descontar.
-        if nombre is None and len(iguales) == 0 and not compatibles.empty:
-            candidatos = sorted(
-                ((SequenceMatcher(None, clave, str(r.clave_nombre)).ratio(), r.descripcion)
-                 for r in compatibles.itertuples()), reverse=True
-            )
-            if candidatos and candidatos[0][0] >= 0.96 and (
-                len(candidatos) == 1 or candidatos[0][0] - candidatos[1][0] >= 0.08
-            ):
-                nombre = str(candidatos[0][1])
+        nombre = asociar_producto_catalogo(
+            descripcion, fila["unidad_pdf"], fila["codigo_pdf"], catalogo
+        )
         if nombre is None:
             pendientes.append(
                 f"{descripcion} | {fila['cantidad']:g} {fila['unidad_pdf']}: "
@@ -890,8 +928,8 @@ with tabs[3]:
                         or "PDF sin texto seleccionable"
                     )
 
-                if st.session_state.get("pdf_parser_version") != 4 or st.session_state.get("pdf_hash") != huella or st.session_state.get("pdf_catalogo") != hashlib.sha256(p.to_json().encode()).hexdigest():
-                    st.session_state["pdf_parser_version"] = 4
+                if st.session_state.get("pdf_parser_version") != 5 or st.session_state.get("pdf_hash") != huella or st.session_state.get("pdf_catalogo") != hashlib.sha256(p.to_json().encode()).hexdigest():
+                    st.session_state["pdf_parser_version"] = 5
                     st.session_state["pdf_hash"] = huella
                     st.session_state["pdf_catalogo"] = hashlib.sha256(p.to_json().encode()).hexdigest()
                     candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p, archivo)
