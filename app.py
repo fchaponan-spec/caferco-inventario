@@ -414,10 +414,13 @@ def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
                 f"{descripcion} | {fila['cantidad']:g} {fila['unidad_pdf']}: "
                 "no existe una coincidencia única y segura; verifica si está en el catálogo"
             )
-        encontrados.append({"nombre": nombre, "cantidad": fila["cantidad"],
-                            "descripcion_pdf": descripcion, "codigo_pdf": fila["codigo_pdf"]})
+        # Solo incluir productos con coincidencia segura en el catálogo.
+        # Los omitidos quedan en el aviso, pero jamás se envían al Kardex.
+        if nombre is not None:
+            encontrados.append({"nombre": nombre, "cantidad": fila["cantidad"],
+                                "descripcion_pdf": descripcion, "codigo_pdf": fila["codigo_pdf"]})
     if not encontrados:
-        pendientes.append("No se identificaron artículos con cantidad. Revisa el texto extraído.")
+        pendientes.append("Ningún producto del PDF coincidió de forma segura con el catálogo; no se puede registrar salida.")
     return encontrados, pendientes
 
 
@@ -928,8 +931,8 @@ with tabs[3]:
                         or "PDF sin texto seleccionable"
                     )
 
-                if st.session_state.get("pdf_parser_version") != 5 or st.session_state.get("pdf_hash") != huella or st.session_state.get("pdf_catalogo") != hashlib.sha256(p.to_json().encode()).hexdigest():
-                    st.session_state["pdf_parser_version"] = 5
+                if st.session_state.get("pdf_parser_version") != 6 or st.session_state.get("pdf_hash") != huella or st.session_state.get("pdf_catalogo") != hashlib.sha256(p.to_json().encode()).hexdigest():
+                    st.session_state["pdf_parser_version"] = 6
                     st.session_state["pdf_hash"] = huella
                     st.session_state["pdf_catalogo"] = hashlib.sha256(p.to_json().encode()).hexdigest()
                     candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p, archivo)
@@ -947,18 +950,24 @@ with tabs[3]:
             if pendientes:
                 with st.expander(f"Líneas no reconocidas automáticamente ({len(pendientes)})"):
                     st.text("\n".join(pendientes[:150]))
-            st.caption("Revisa cada descripción del PDF y selecciona el producto del catálogo si aparece vacío. Ninguna salida se descuenta sin tu confirmación.")
+            st.info(
+                f"Productos reconocidos para descontar: {len(st.session_state['lineas_pdf'])}. "
+                f"Líneas omitidas: {len(pendientes)}. "
+                "Los omitidos NO se registrarán ni se descontarán."
+            )
+            st.caption("Solo se muestran productos existentes identificados de forma segura. Verifica los nombres y las cantidades antes de confirmar.")
 
             editadas = st.data_editor(
                 st.session_state["lineas_pdf"],
-                num_rows="dynamic",
+                num_rows="fixed",
                 use_container_width=True,
                 hide_index=True,
                 column_config={
                     "nombre": st.column_config.SelectboxColumn(
                         "Nombre completo del producto",
                         options=p["descripcion"].dropna().tolist(),
-                        required=True
+                        required=True,
+                        disabled=True
                     ),
                     "cantidad": st.column_config.NumberColumn(
                         "Cantidad", min_value=0.001, format="%.3f", required=True
@@ -978,8 +987,8 @@ with tabs[3]:
             )
 
             confirmar = st.checkbox(
-                "He revisado el PDF, los nombres, "
-                "las cantidades y el número de guía"
+                "Confirmo descontar SOLO los productos reconocidos y OMITIR los no identificados de esta guía",
+                key=f"confirmar_parcial_{huella}"
             )
 
             if st.button(
@@ -995,7 +1004,7 @@ with tabs[3]:
 
                     if editadas.empty:
                         raise ValueError(
-                            "Agrega al menos una línea"
+                            "No hay productos registrados reconocidos en esta guía. No se descontó nada."
                         )
 
                     if editadas[
@@ -1017,6 +1026,8 @@ with tabs[3]:
                             raise ValueError("La cantidad debe ser mayor que cero")
                         lineas.append({"codigo": str(mapa_nombres[nombre]), "cantidad": float(fila.cantidad)})
 
+                    # La función RPC debe validar stock y evitar guías duplicadas.
+                    # Solo se envían los productos existentes reconocidos.
                     db().rpc(
                         "app_registrar_salida",
                         {
@@ -1028,8 +1039,8 @@ with tabs[3]:
                     ).execute()
 
                     st.success(
-                        "Salida registrada y stock "
-                        "descontado correctamente"
+                        f"Salida parcial registrada: {len(lineas)} líneas reconocidas "
+                        f"descontadas del stock. {len(pendientes)} líneas omitidas."
                     )
 
                     st.session_state.pop(
