@@ -4,6 +4,7 @@ import hashlib
 import hmac
 from datetime import datetime
 import unicodedata
+from difflib import SequenceMatcher
 
 import fitz
 import pandas as pd
@@ -266,6 +267,25 @@ def normalizar_nombre(valor):
     return " ".join(texto.split())
 
 
+def clave_producto_flexible(valor):
+    """Normaliza variantes tipográficas sin borrar medidas ni números."""
+    texto = unicodedata.normalize("NFKD", str(valor).upper())
+    texto = "".join(c for c in texto if not unicodedata.combining(c))
+    texto = texto.replace("½", " 1/2").replace("×", "X")
+    texto = re.sub(r"(?<=\d)\s*1/2", ".5", texto)
+    texto = re.sub(r"\b(PAQUETE|PAQUETES)\b", "PQT", texto)
+    texto = re.sub(r"[^A-Z0-9]+", " ", texto)
+    return " ".join(texto.split())
+
+
+def unidad_equivalente(valor):
+    u = str(valor).upper().strip()
+    return {"ROLLOS":"ROLLO", "UNIDAD":"UND", "UNIDADES":"UND",
+            "UNID":"UND", "PAQ":"PQT", "PAQUETE":"PQT",
+            "PAQUETES":"PQT", "CAJAS":"CAJA", "BOLSAS":"BOLSA",
+            "KGS":"KG"}.get(u, u)
+
+
 def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
     """Extrae productos por DESCRIPCIÓN de notas de venta y guías de remisión CAFERCO.
 
@@ -277,8 +297,8 @@ def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
         return encontrados, ["El PDF no tiene texto seleccionable."]
 
     catalogo = catalogo.copy()
-    catalogo["clave_nombre"] = catalogo["descripcion"].map(normalizar_nombre)
-    catalogo["clave_unidad"] = catalogo["unidad"].astype(str).str.upper().str.strip()
+    catalogo["clave_nombre"] = catalogo["descripcion"].map(clave_producto_flexible)
+    catalogo["clave_unidad"] = catalogo["unidad"].map(unidad_equivalente)
     lineas = texto.splitlines()
     unidades = r"ROLLOS?|UND|UNID(?:AD(?:ES)?)?|KG|KGS|CAJAS?|PQT|PAQ|BOLSAS?|M2|M"
     mapa_unidades = {"ROLLOS": "ROLLO", "CAJAS": "CAJA", "BOLSAS": "BOLSA",
@@ -336,15 +356,25 @@ def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
 
     for fila in filas:
         descripcion = " ".join(fila["descripcion_pdf"].split())
-        iguales = catalogo[
-            (catalogo["clave_nombre"] == normalizar_nombre(descripcion)) &
-            (catalogo["clave_unidad"] == fila["unidad_pdf"])
-        ]
+        clave = clave_producto_flexible(descripcion)
+        compatibles = catalogo[catalogo["clave_unidad"] == unidad_equivalente(fila["unidad_pdf"])]
+        iguales = compatibles[compatibles["clave_nombre"] == clave]
         nombre = str(iguales.iloc[0]["descripcion"]) if len(iguales) == 1 else None
+        # Solo autoseleccionar una variante casi idéntica, inequívoca.
+        # Nunca usar únicamente el código impreso para descontar.
+        if nombre is None and len(iguales) == 0 and not compatibles.empty:
+            candidatos = sorted(
+                ((SequenceMatcher(None, clave, str(r.clave_nombre)).ratio(), r.descripcion)
+                 for r in compatibles.itertuples()), reverse=True
+            )
+            if candidatos and candidatos[0][0] >= 0.96 and (
+                len(candidatos) == 1 or candidatos[0][0] - candidatos[1][0] >= 0.08
+            ):
+                nombre = str(candidatos[0][1])
         if nombre is None:
             pendientes.append(
                 f"{descripcion} | {fila['cantidad']:g} {fila['unidad_pdf']}: "
-                "selecciona el nombre correcto del catálogo"
+                "no existe una coincidencia única y segura; verifica si está en el catálogo"
             )
         encontrados.append({"nombre": nombre, "cantidad": fila["cantidad"],
                             "descripcion_pdf": descripcion, "codigo_pdf": fila["codigo_pdf"]})
