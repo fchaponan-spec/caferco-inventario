@@ -936,7 +936,7 @@ with tabs[3]:
                     st.session_state["pdf_hash"] = huella
                     st.session_state["pdf_catalogo"] = hashlib.sha256(p.to_json().encode()).hexdigest()
                     candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p, archivo)
-                    st.session_state["lineas_pdf"] = pd.DataFrame(candidatos, columns=["nombre", "cantidad", "descripcion_pdf", "codigo_pdf"])
+                    st.session_state["lineas_pdf"] = pd.DataFrame([{**fila, "descontar": True} for fila in candidatos], columns=["descontar", "nombre", "cantidad", "descripcion_pdf", "codigo_pdf"])
                     st.session_state["lineas_no_reconocidas"] = no_reconocidas
 
             except Exception as e:
@@ -955,7 +955,7 @@ with tabs[3]:
                 f"Líneas omitidas: {len(pendientes)}. "
                 "Los omitidos NO se registrarán ni se descontarán."
             )
-            st.caption("Solo se muestran productos existentes identificados de forma segura. Verifica los nombres y las cantidades antes de confirmar.")
+            st.caption("Marca o desmarca 'Descontar' para decidir qué productos incluir en esta salida. Los desmarcados no se enviarán al Kardex. Puedes revisar el inventario producto por producto.")
 
             editadas = st.data_editor(
                 st.session_state["lineas_pdf"],
@@ -963,6 +963,9 @@ with tabs[3]:
                 use_container_width=True,
                 hide_index=True,
                 column_config={
+                    "descontar": st.column_config.CheckboxColumn(
+                        "Descontar", help="Desmarca para excluir este registro de la salida", default=True, required=True
+                    ),
                     "nombre": st.column_config.SelectboxColumn(
                         "Nombre completo del producto",
                         options=p["descripcion"].dropna().tolist(),
@@ -975,8 +978,21 @@ with tabs[3]:
                     "descripcion_pdf": st.column_config.TextColumn("Descripción leída del PDF", disabled=True),
                     "codigo_pdf": st.column_config.TextColumn("Código impreso (referencia)", disabled=True)
                 },
-                key=f"editor_pdf_{huella}_{st.session_state.get('pdf_catalogo', '')[:10]}"
+                key=f"editor_pdf_exclusion_v1_{huella}_{st.session_state.get('pdf_catalogo', '')[:10]}"
             )
+
+            seleccionadas = editadas.loc[editadas["descontar"].fillna(False).astype(bool)].copy()
+            excluidas = len(editadas) - len(seleccionadas)
+            st.info(
+                f"Se descontarán {len(seleccionadas)} líneas seleccionadas. "
+                f"Excluidas manualmente: {excluidas}. "
+                f"No reconocidas y omitidas: {len(pendientes)}."
+            )
+            if excluidas:
+                with st.expander(f"Ver {excluidas} producto(s) excluido(s) manualmente"):
+                    st.dataframe(editadas.loc[~editadas["descontar"].fillna(False).astype(bool),
+                                                ["nombre", "cantidad", "descripcion_pdf"]],
+                                 hide_index=True, use_container_width=True)
 
             st.subheader("Stock disponible")
 
@@ -987,7 +1003,7 @@ with tabs[3]:
             )
 
             confirmar = st.checkbox(
-                "Confirmo descontar SOLO los productos reconocidos y OMITIR los no identificados de esta guía",
+                "Confirmo descontar SOLO los productos marcados en la columna 'Descontar'; los desmarcados y no identificados se omitirán",
                 key=f"confirmar_parcial_{huella}"
             )
 
@@ -1002,12 +1018,14 @@ with tabs[3]:
                             "Escribe el número de guía"
                         )
 
-                    if editadas.empty:
+                    # Usar exclusivamente las líneas marcadas; los demás registros no se envían.
+                    seleccionadas = editadas.loc[editadas["descontar"].fillna(False).astype(bool)].copy()
+                    if seleccionadas.empty:
                         raise ValueError(
-                            "No hay productos registrados reconocidos en esta guía. No se descontó nada."
+                            "No seleccionaste productos para descontar. Marca al menos uno en la columna 'Descontar'."
                         )
 
-                    if editadas[
+                    if seleccionadas[
                         ["nombre", "cantidad"]
                     ].isna().any().any():
                         raise ValueError(
@@ -1018,7 +1036,7 @@ with tabs[3]:
                     # Solo nombres únicos: no se adivina un código si hay descripciones duplicadas.
                     conteos_nombres = p["descripcion"].value_counts()
                     mapa_nombres = dict(zip(p["descripcion"], p["codigo"]))
-                    for fila in editadas.itertuples(index=False):
+                    for fila in seleccionadas.itertuples(index=False):
                         nombre = str(fila.nombre)
                         if nombre not in mapa_nombres or conteos_nombres[nombre] != 1:
                             raise ValueError(f"Nombre no encontrado o duplicado: {nombre}. Corrige el catálogo antes de continuar.")
@@ -1040,7 +1058,8 @@ with tabs[3]:
 
                     st.success(
                         f"Salida parcial registrada: {len(lineas)} líneas reconocidas "
-                        f"descontadas del stock. {len(pendientes)} líneas omitidas."
+                        f"enviadas para descuento. {len(pendientes)} no reconocidas y "
+                        f"{len(editadas) - len(seleccionadas)} excluidas manualmente."
                     )
 
                     st.session_state.pop(
