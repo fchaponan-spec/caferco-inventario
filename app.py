@@ -4,7 +4,6 @@ import hashlib
 import hmac
 from datetime import datetime
 import unicodedata
-from difflib import SequenceMatcher
 
 import fitz
 import pandas as pd
@@ -267,160 +266,96 @@ def normalizar_nombre(valor):
     return " ".join(texto.split())
 
 
-def clave_producto_flexible(valor):
-    """Normaliza presentación sin perder números, calibres ni dimensiones."""
-    texto = str(valor).upper().strip()
-    texto = texto.replace("½", " 1/2").replace("¼", " 1/4").replace("¾", " 3/4")
-    texto = texto.replace("×", "X").replace("⁄", "/")
-    texto = unicodedata.normalize("NFKD", texto)
-    texto = "".join(c for c in texto if not unicodedata.combining(c))
-    texto = re.sub(r"(?<=\d)\s+1/2\b", ".5", texto)
-    texto = re.sub(r"(?<=\d)\s+1/4\b", ".25", texto)
-    texto = re.sub(r"(?<=\d)\s+3/4\b", ".75", texto)
-    texto = re.sub(r"\b(PAQUETES?|PAQ)\b", "PQT", texto)
-    texto = re.sub(r"\b(UNIDADES?|UNID)\b", "UND", texto)
-    texto = re.sub(r"\b(ROLLOS)\b", "ROLLO", texto)
-    texto = re.sub(r"\b(C\s*/\s*)", "CON ", texto)
-    texto = re.sub(r"[^A-Z0-9.]+", " ", texto)
-    return " ".join(texto.split())
-
-
-def unidad_equivalente(valor):
-    u = str(valor).upper().strip()
-    return {"ROLLOS":"ROLLO", "UNIDAD":"UND", "UNIDADES":"UND",
-            "UNID":"UND", "PAQ":"PQT", "PAQUETE":"PQT",
-            "PAQUETES":"PQT", "CAJAS":"CAJA", "BOLSAS":"BOLSA",
-            "KGS":"KG"}.get(u, u)
-
-
-def numeros_producto(valor):
-    """Protege calibres y medidas contra coincidencias falsas."""
-    return re.findall(r"(?<![A-Z])\d+(?:\.\d+)?", clave_producto_flexible(valor))
-
-
-def asociar_producto_catalogo(descripcion, unidad, codigo_pdf, catalogo):
-    """Busca por nombre; el código de la guía solo confirma candidatos compatibles."""
-    clave = clave_producto_flexible(descripcion)
-    compatibles = catalogo[catalogo["clave_unidad"] == unidad_equivalente(unidad)]
-    if compatibles.empty:
-        return None
-    exactos = compatibles[compatibles["clave_nombre"] == clave]
-    if len(exactos) == 1:
-        return str(exactos.iloc[0]["descripcion"])
-    if len(exactos) > 1:
-        return None
-
-    # Si la descripción varía ligeramente, un código igual es una corroboración,
-    # nunca el único criterio. Se exige también similitud de nombre y unidad.
-    por_codigo = compatibles[compatibles["codigo"].astype(str).str.strip().str.upper() == str(codigo_pdf).strip().upper()]
-    if len(por_codigo) == 1:
-        candidato = por_codigo.iloc[0]
-        similitud = SequenceMatcher(None, clave, str(candidato["clave_nombre"])).ratio()
-        if similitud >= 0.70 and numeros_producto(descripcion) == numeros_producto(candidato["descripcion"]):
-            return str(candidato["descripcion"])
-
-    # Para diferencias de puntuación y abreviaturas, emparejar solo si es
-    # inequívoco y conserva exactamente las cifras (calibres, medidas, etc.).
-    opciones = []
-    numeros = numeros_producto(descripcion)
-    for r in compatibles.itertuples():
-        if numeros != numeros_producto(r.descripcion):
-            continue
-        ratio = SequenceMatcher(None, clave, str(r.clave_nombre)).ratio()
-        opciones.append((ratio, str(r.descripcion)))
-    opciones.sort(reverse=True)
-    if opciones and opciones[0][0] >= 0.90 and (
-        len(opciones) == 1 or opciones[0][0] - opciones[1][0] >= 0.10
-    ):
-        return opciones[0][1]
-    return None
-
-
 def detectar_candidatos_por_nombre(texto, catalogo, archivo=None):
-    """Extrae productos por DESCRIPCIÓN de notas de venta y guías de remisión CAFERCO.
+    """Interpreta notas de venta y guías de remisión electrónica CAFERCO.
 
-    Los códigos impresos son informativos; la asociación al catálogo se realiza
-    por nombre normalizado y unidad. Nunca se adivina un producto ambiguo.
+    Nunca registra movimientos: solo propone líneas para revisión humana.
     """
     encontrados, pendientes = [], []
     if not texto or not texto.strip():
-        return encontrados, ["El PDF no tiene texto seleccionable."]
+        return encontrados, ["El PDF no contiene texto seleccionable."]
 
     catalogo = catalogo.copy()
-    catalogo["clave_nombre"] = catalogo["descripcion"].map(clave_producto_flexible)
-    catalogo["clave_unidad"] = catalogo["unidad"].map(unidad_equivalente)
+    catalogo["clave_nombre"] = catalogo["descripcion"].map(normalizar_nombre)
     lineas = texto.splitlines()
-    unidades = r"ROLLOS?|UND|UNID(?:AD(?:ES)?)?|KG|KGS|CAJAS?|PQT|PAQ|BOLSAS?|M2|M"
-    mapa_unidades = {"ROLLOS": "ROLLO", "CAJAS": "CAJA", "BOLSAS": "BOLSA",
-                     "KGS": "KG", "UNIDAD": "UND", "UNIDADES": "UND", "UNID": "UND"}
     filas = []
 
-    # GUÍA DE REMISIÓN ELECTRÓNICA: CÓDIGO | DESCRIPCIÓN | UM | CANTIDAD.
-    # La columna CANTIDAD es la última de la línea; no se confunde con medidas.
-    es_remision = any(
-        re.search(r"C[OÓ]DIGO\s+DESCRIPCI[OÓ]N\s+UM\s+CANTIDAD", l, re.I)
-        for l in lineas
-    )
-    if es_remision:
-        inicio = next(i + 1 for i, l in enumerate(lineas)
-                      if re.search(r"C[OÓ]DIGO\s+DESCRIPCI[OÓ]N\s+UM\s+CANTIDAD", l, re.I))
+    # Formato GRE: CÓDIGO | DESCRIPCIÓN | UM | CANTIDAD.
+    # A diferencia de una nota de venta, la cantidad aparece DESPUÉS de la unidad.
+    if re.search(r"GUIA DE REMISION|GUÍA DE REMISIÓN", texto, re.I):
+        inicio = next((i + 1 for i, l in enumerate(lineas)
+                       if "DESCRIPCION" in normalizar_nombre(l)
+                       and "CANTIDAD" in normalizar_nombre(l)
+                       and "CODIGO" in normalizar_nombre(l)), None)
+        if inicio is None:
+            return [], ["No se encontró la tabla de productos de la guía electrónica."]
         patron = re.compile(
-            rf"^\s*([A-Z0-9-]{{2,}})\s{{2,}}(.+?)\s{{2,}}({unidades})\s+(\d+(?:[.,]\d+)?)\s*$",
+            r"^\s*(\d{3,12})\s+(.+?)\s+(LATA|LATAS|ROLLO|ROLLOS|UND|UNID|UNIDAD|UNIDADES|KG|KGS|CAJA|CAJAS|BOLSA|BOLSAS|PAQ|M|M2)\s+(\d+(?:[.,]\d+)?)\s*$",
             re.I
         )
         for linea in lineas[inicio:]:
-            if re.search(r"^\s*(?:Observaci[oó]n|Total cantidad bultos|Resumen:|Powered by)", linea, re.I):
+            if re.search(r"^\s*(Observaci[oó]n|Total cantidad|Total Peso|Resumen:|Powered by)", linea, re.I):
                 break
-            match = patron.match(linea)
-            if not match:
-                continue
-            codigo_pdf, descripcion, unidad, cantidad = match.groups()
-            unidad = mapa_unidades.get(unidad.upper(), unidad.upper())
-            filas.append({"codigo_pdf": codigo_pdf, "descripcion_pdf": descripcion.strip(),
-                          "cantidad": float(cantidad.replace(',', '.')), "unidad_pdf": unidad})
+            m = patron.match(linea)
+            if m:
+                filas.append({"codigo_pdf": m.group(1),
+                              "descripcion_pdf": m.group(2).strip(),
+                              "unidad_pdf": m.group(3).upper(),
+                              "cantidad": float(m.group(4).replace(",", "."))})
     else:
-        # NOTA DE VENTA: ITM | CÓDIGO | DESCRIPCIÓN | CANTIDAD+UM | PRECIOS.
+        # Formato nota de venta: ITM CODIGO DESCRIPCION ... CANTIDAD U.M.
         inicio = next((i + 1 for i, l in enumerate(lineas)
-                       if re.search(r"\bITM\s+CODIGO\b", l.upper())), None)
+                       if re.search(r"\bITM\s+CODIGO\b", normalizar_nombre(l))), None)
         if inicio is None:
-            return [], ["No se encontró un encabezado compatible de nota de venta o guía de remisión."]
+            return [], ["No se encontró un formato de guía compatible."]
         patron_item = re.compile(r"^\s*(\d{1,3})\s+([A-Z0-9-]{2,})\s+(.+)$")
         patron_cantidad = re.compile(
-            rf"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*({unidades})\b", re.I
-        )
+            r"(?<![\d.,])(\d+(?:[.,]\d+)?)\s*(ROLLOS?|UND|UNID(?:AD(?:ES)?)?|KG|KGS|CAJAS?|PAQ|BOLSAS?)\b", re.I)
         for linea in lineas[inicio:]:
-            if re.search(r"^\s*(?:SON:|TOTAL\b|EXIJA\b|Powered by\b)", linea, re.I):
+            if re.search(r"^\s*(SON:|TOTAL\b|EXIJA\b|Powered by\b)", linea, re.I):
                 break
-            match = patron_item.match(linea)
-            if match:
-                cm = patron_cantidad.search(match.group(3))
-                if cm:
-                    unidad = mapa_unidades.get(cm.group(2).upper(), cm.group(2).upper())
-                    filas.append({"codigo_pdf": match.group(2),
-                                  "descripcion_pdf": match.group(3)[:cm.start()].strip(),
-                                  "cantidad": float(cm.group(1).replace(',', '.')),
-                                  "unidad_pdf": unidad})
+            m = patron_item.match(linea)
+            if m:
+                cant = patron_cantidad.search(m.group(3))
+                if cant:
+                    filas.append({"codigo_pdf": m.group(2),
+                                  "descripcion_pdf": m.group(3)[:cant.start()].strip(),
+                                  "cantidad": float(cant.group(1).replace(",", ".")),
+                                  "unidad_pdf": cant.group(2).upper()})
                     continue
             if filas and linea.strip() and not patron_cantidad.search(linea):
                 filas[-1]["descripcion_pdf"] += " " + linea.strip()
 
+    equivalencias = {"ROLLOS": "ROLLO", "LATAS": "LATA", "UNIDAD": "UND",
+                     "UNIDADES": "UND", "UNID": "UND", "KGS": "KG",
+                     "CAJAS": "CAJA", "BOLSAS": "BOLSA"}
     for fila in filas:
         descripcion = " ".join(fila["descripcion_pdf"].split())
-        nombre = asociar_producto_catalogo(
-            descripcion, fila["unidad_pdf"], fila["codigo_pdf"], catalogo
-        )
-        if nombre is None:
-            pendientes.append(
-                f"{descripcion} | {fila['cantidad']:g} {fila['unidad_pdf']}: "
-                "no existe una coincidencia única y segura; verifica si está en el catálogo"
-            )
-        # Solo incluir productos con coincidencia segura en el catálogo.
-        # Los omitidos quedan en el aviso, pero jamás se envían al Kardex.
-        if nombre is not None:
-            encontrados.append({"nombre": nombre, "cantidad": fila["cantidad"],
-                                "descripcion_pdf": descripcion, "codigo_pdf": fila["codigo_pdf"]})
+        clave = normalizar_nombre(descripcion)
+        unidad_pdf = equivalencias.get(fila["unidad_pdf"], fila["unidad_pdf"])
+        coincidencias = catalogo[catalogo["clave_nombre"] == clave]
+        nombre = None
+        if len(coincidencias) == 1:
+            producto = coincidencias.iloc[0]
+            unidad_catalogo = str(producto["unidad"]).upper()
+            # LATA es una presentación de producto. Si el nombre contiene LATA,
+            # una LATA del PDF puede corresponder a una UND del catálogo.
+            unidad_valida = (unidad_pdf == unidad_catalogo or
+                             (unidad_pdf == "LATA" and unidad_catalogo == "UND"
+                              and "LATA" in clave.split()))
+            if unidad_valida:
+                nombre = str(producto["descripcion"])
+            else:
+                pendientes.append(
+                    f"{descripcion}: unidad PDF {unidad_pdf} y catálogo {unidad_catalogo}; revisa la equivalencia.")
+        elif len(coincidencias) > 1:
+            pendientes.append(f"{descripcion}: hay nombres duplicados en el catálogo.")
+        else:
+            pendientes.append(f"{descripcion}: no se encontró ese nombre en el catálogo.")
+        encontrados.append({"nombre": nombre, "cantidad": fila["cantidad"],
+                            "descripcion_pdf": descripcion, "codigo_pdf": fila["codigo_pdf"]})
     if not encontrados:
-        pendientes.append("Ningún producto del PDF coincidió de forma segura con el catálogo; no se puede registrar salida.")
+        pendientes.append("No se identificaron filas con cantidades; revisa el PDF.")
     return encontrados, pendientes
 
 
@@ -931,12 +866,12 @@ with tabs[3]:
                         or "PDF sin texto seleccionable"
                     )
 
-                if st.session_state.get("pdf_parser_version") != 6 or st.session_state.get("pdf_hash") != huella or st.session_state.get("pdf_catalogo") != hashlib.sha256(p.to_json().encode()).hexdigest():
-                    st.session_state["pdf_parser_version"] = 6
+                if st.session_state.get("pdf_parser_version") != 4 or st.session_state.get("pdf_hash") != huella or st.session_state.get("pdf_catalogo") != hashlib.sha256(p.to_json().encode()).hexdigest():
+                    st.session_state["pdf_parser_version"] = 4
                     st.session_state["pdf_hash"] = huella
                     st.session_state["pdf_catalogo"] = hashlib.sha256(p.to_json().encode()).hexdigest()
                     candidatos, no_reconocidas = detectar_candidatos_por_nombre(texto, p, archivo)
-                    st.session_state["lineas_pdf"] = pd.DataFrame([{**fila, "descontar": True} for fila in candidatos], columns=["descontar", "nombre", "cantidad", "descripcion_pdf", "codigo_pdf"])
+                    st.session_state["lineas_pdf"] = pd.DataFrame(candidatos, columns=["nombre", "cantidad", "descripcion_pdf", "codigo_pdf"])
                     st.session_state["lineas_no_reconocidas"] = no_reconocidas
 
             except Exception as e:
@@ -950,27 +885,18 @@ with tabs[3]:
             if pendientes:
                 with st.expander(f"Líneas no reconocidas automáticamente ({len(pendientes)})"):
                     st.text("\n".join(pendientes[:150]))
-            st.info(
-                f"Productos reconocidos para descontar: {len(st.session_state['lineas_pdf'])}. "
-                f"Líneas omitidas: {len(pendientes)}. "
-                "Los omitidos NO se registrarán ni se descontarán."
-            )
-            st.caption("Marca o desmarca 'Descontar' para decidir qué productos incluir en esta salida. Los desmarcados no se enviarán al Kardex. Puedes revisar el inventario producto por producto.")
+            st.caption("Revisa cada descripción del PDF y selecciona el producto del catálogo si aparece vacío. Ninguna salida se descuenta sin tu confirmación.")
 
             editadas = st.data_editor(
                 st.session_state["lineas_pdf"],
-                num_rows="fixed",
+                num_rows="dynamic",
                 use_container_width=True,
                 hide_index=True,
                 column_config={
-                    "descontar": st.column_config.CheckboxColumn(
-                        "Descontar", help="Desmarca para excluir este registro de la salida", default=True, required=True
-                    ),
                     "nombre": st.column_config.SelectboxColumn(
                         "Nombre completo del producto",
                         options=p["descripcion"].dropna().tolist(),
-                        required=True,
-                        disabled=True
+                        required=True
                     ),
                     "cantidad": st.column_config.NumberColumn(
                         "Cantidad", min_value=0.001, format="%.3f", required=True
@@ -978,21 +904,8 @@ with tabs[3]:
                     "descripcion_pdf": st.column_config.TextColumn("Descripción leída del PDF", disabled=True),
                     "codigo_pdf": st.column_config.TextColumn("Código impreso (referencia)", disabled=True)
                 },
-                key=f"editor_pdf_exclusion_v1_{huella}_{st.session_state.get('pdf_catalogo', '')[:10]}"
+                key=f"editor_pdf_{huella}_{st.session_state.get('pdf_catalogo', '')[:10]}"
             )
-
-            seleccionadas = editadas.loc[editadas["descontar"].fillna(False).astype(bool)].copy()
-            excluidas = len(editadas) - len(seleccionadas)
-            st.info(
-                f"Se descontarán {len(seleccionadas)} líneas seleccionadas. "
-                f"Excluidas manualmente: {excluidas}. "
-                f"No reconocidas y omitidas: {len(pendientes)}."
-            )
-            if excluidas:
-                with st.expander(f"Ver {excluidas} producto(s) excluido(s) manualmente"):
-                    st.dataframe(editadas.loc[~editadas["descontar"].fillna(False).astype(bool),
-                                                ["nombre", "cantidad", "descripcion_pdf"]],
-                                 hide_index=True, use_container_width=True)
 
             st.subheader("Stock disponible")
 
@@ -1003,8 +916,8 @@ with tabs[3]:
             )
 
             confirmar = st.checkbox(
-                "Confirmo descontar SOLO los productos marcados en la columna 'Descontar'; los desmarcados y no identificados se omitirán",
-                key=f"confirmar_parcial_{huella}"
+                "He revisado el PDF, los nombres, "
+                "las cantidades y el número de guía"
             )
 
             if st.button(
@@ -1018,14 +931,12 @@ with tabs[3]:
                             "Escribe el número de guía"
                         )
 
-                    # Usar exclusivamente las líneas marcadas; los demás registros no se envían.
-                    seleccionadas = editadas.loc[editadas["descontar"].fillna(False).astype(bool)].copy()
-                    if seleccionadas.empty:
+                    if editadas.empty:
                         raise ValueError(
-                            "No seleccionaste productos para descontar. Marca al menos uno en la columna 'Descontar'."
+                            "Agrega al menos una línea"
                         )
 
-                    if seleccionadas[
+                    if editadas[
                         ["nombre", "cantidad"]
                     ].isna().any().any():
                         raise ValueError(
@@ -1036,7 +947,7 @@ with tabs[3]:
                     # Solo nombres únicos: no se adivina un código si hay descripciones duplicadas.
                     conteos_nombres = p["descripcion"].value_counts()
                     mapa_nombres = dict(zip(p["descripcion"], p["codigo"]))
-                    for fila in seleccionadas.itertuples(index=False):
+                    for fila in editadas.itertuples(index=False):
                         nombre = str(fila.nombre)
                         if nombre not in mapa_nombres or conteos_nombres[nombre] != 1:
                             raise ValueError(f"Nombre no encontrado o duplicado: {nombre}. Corrige el catálogo antes de continuar.")
@@ -1044,8 +955,6 @@ with tabs[3]:
                             raise ValueError("La cantidad debe ser mayor que cero")
                         lineas.append({"codigo": str(mapa_nombres[nombre]), "cantidad": float(fila.cantidad)})
 
-                    # La función RPC debe validar stock y evitar guías duplicadas.
-                    # Solo se envían los productos existentes reconocidos.
                     db().rpc(
                         "app_registrar_salida",
                         {
@@ -1057,9 +966,8 @@ with tabs[3]:
                     ).execute()
 
                     st.success(
-                        f"Salida parcial registrada: {len(lineas)} líneas reconocidas "
-                        f"enviadas para descuento. {len(pendientes)} no reconocidas y "
-                        f"{len(editadas) - len(seleccionadas)} excluidas manualmente."
+                        "Salida registrada y stock "
+                        "descontado correctamente"
                     )
 
                     st.session_state.pop(
